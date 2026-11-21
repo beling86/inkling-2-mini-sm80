@@ -13,6 +13,7 @@
 # LEN    context length (default 262144)
 # CACHE  where compiled kernels are kept between runs (default ~/.cache/inkling2-sm80)
 # IMAGE  defaults to the image build these patches were made against (pinned by digest)
+# NAME   container name (default inkling2-sm80)
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -36,7 +37,7 @@ while IFS= read -r f; do
     mounts+=(-v "${HERE}/patches/vllm/${f}:${VLLM}/${f}:ro")
 done < <(cd "${HERE}/patches/vllm" && find . -name '*.py' | sed 's|^\./||' | sort)
 
-exec docker run --rm --name inkling2-sm80 \
+exec docker run --rm --name "${NAME:-inkling2-sm80}" \
     --gpus "\"device=${GPU}\"" --ipc=host \
     -p "${BIND}:${PORT}:8000" \
     -v "${MODEL}:/model:ro" \

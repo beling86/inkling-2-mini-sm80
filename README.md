@@ -37,6 +37,7 @@ later starts take about two minutes.
 | `K` | `4` | how many tokens the DSpark drafter proposes per step (1-7), see below |
 | `LEN` | `262144` | context length |
 | `IMAGE` | the tested build, pinned by digest | the patches replace whole files of that build |
+| `NAME` | `inkling2-sm80` | container name, to run several at once |
 
 Any extra arguments are passed to `vllm serve`, e.g. `./run.sh --max-num-seqs 16`.
 
@@ -57,6 +58,12 @@ draft tokens) with only the changes needed to run on sm_80. "Tuned" is this repo
 | Lists and structured text, 1 / 8 users (total tok/s) | 259 / 1,094 | **289 / 1,243** |
 | Code, 1 / 8 users | 168 / 561 | **208-231 / 748** |
 | Prose, 1 / 8 users | 118 / 501 | **162 / 683** |
+
+The latest changes (one-launch q/k/v on loop passes, gemv tiles measured with cold weights, the drafter's Markov
+matmul on the gemv) shorten each decode step by 3-4%, on the same card: 13.4 → 13.0 ms on chat, 12.9 → 12.4 ms on
+counting, 13.2 → 12.9 ms on random words; decode at 262k went from 86 to 90 tok/s. Greedy answers are identical to
+the previous version on 52 test prompts. Single runs of the figures above vary by about ±5% for one user and ±10% for
+8 users, so they are left as first measured.
 
 ### Why the kind of text matters
 
@@ -111,8 +118,14 @@ k=4 is the best all-rounder: chat, code, long context and several users. k=7 onl
 - `ops/moe_sm90.py`: Humming expert-GEMM tiles for decode-sized batches (`[8, 256, 128]`, 2 CTAs per SM), from a
   192-config sweep; they run at memory bandwidth. Override with `INKLING_SM80_HUMMING='{"block_shape": [...], ...}'`.
 - `ops/gemv.py`: the image's own low-row Triton GEMV (written for SM12x) now handles every 1-16-row bf16 matmul on
-  sm_80 too, both vocab heads included, with tiles chosen per shape. cuBLAS picks split-K kernels plus a reduce here:
-  the output projection drops from 16 to 9 µs and the vocab head from 780 to 650 µs.
+  sm_80 too, both vocab heads included, with tiles chosen per shape (measured with the weights cycled past the 40 MB
+  L2, as in the model; a sweep that reuses one weight picks tiles that only win from cache). cuBLAS picks split-K
+  kernels plus a reduce here: the output projection drops from 16 to 9 µs and the vocab head from 780 to 550 µs.
+- `attention.py` + `ops/gemv.py`: on loop passes (and in full-attention layers) the q-side, k and v projections each
+  read a different input, so they ran as three launches; the k and v ones (1024 rows) reached only a quarter of the
+  memory bandwidth. One launch now covers all three segments, each block reading its own input: 46 → 29 µs.
+- `dspark.py`: the drafter's Markov correction multiplies a 201k-row matrix once per draft token; it now runs on the
+  same gemv (84 → 71 µs a call).
 - `loop.py` + `ops/gemv.py`: the loop layers' message controllers run two batched matmuls. cuBLAS gave the first of
   them (N=64, K=4608) one block per stream. Two Triton kernels now do the pair, with K split across blocks: 25 µs
   becomes 10 µs.
@@ -120,7 +133,8 @@ k=4 is the best all-rounder: chat, code, long context and several users. k=7 onl
   relative-position range, so its bias is zero and its mask is all-true. Those blocks now take a plain flash-attention
   loop, which makes full-attention prefill 1.5-1.8x faster and long-context verification 1.3x faster. The prefill
   tiles are retuned too: 32-key tiles for full layers, 64-key / 8 warps / 3 stages for window layers.
-- `dspark.py`: DSpark accepts fewer than 7 draft tokens. Verifying fewer tokens reads fewer distinct experts per step.
+- `dspark.py`: DSpark also accepts fewer than 7 draft tokens. Verifying fewer tokens reads fewer distinct experts per
+  step.
 
 A decode step at k=4 takes about 13.4 ms: about 4.8 ms of expert GEMMs (at memory bandwidth), 3.5 ms of dense
 matmuls, and the rest spread over about 1,400 small kernels. Pre-Hopper GPUs have no programmatic dependent launch to
@@ -133,6 +147,13 @@ passes per token (two of the four full layers are inside the loop) grow quadrati
 - W8A8 small matmuls: quantizing the activations costs more than it saves, and it changes outputs.
 - Marlin 4-bit: no sm_80 kernel in this image.
 - Adaptive draft verification: needs a confidence head the checkpoint does not have.
+- Fusing the small kernels. The loop controller's four kernels in one (with grid barriers): 25 µs against 20. The
+  short conv and the mix that follows it in one kernel (bit-exact): 14.5 µs against 12.2. Folding the pair norm into
+  the controller's first matmul: slower too. A kernel boundary inside a CUDA graph costs only about 1 µs on this card;
+  these kernels are slow because of chains of dependent memory reads, and merging them serializes work that separate
+  launches spread over more blocks.
+- A smaller draft vocabulary: up to ~0.7 ms a step saved on the draft heads, but drafts could no longer be rare
+  tokens, which costs acceptance; not worth the approximation.
 
 `patches/sm80.diff` shows every change against the image's files. `tools/trace_kernels.py` sums kernel time from a
 vLLM torch-profiler trace: start the server with `--profiler-config`, then POST `/start_profile` and `/stop_profile`.

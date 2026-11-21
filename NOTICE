@@ -9,6 +9,7 @@ vllm/vllm-openai:inkling-2-mini image (vLLM 0.1.dev25855+g7cb5dae22), changed to
 NVIDIA sm_80 (Ampere) GPUs and to run faster there; patches/sm80.diff shows every change:
 
   models/inkling2/quant_config.py
+  models/inkling2/nvidia/attention.py
   models/inkling2/nvidia/dspark.py
   models/inkling2/nvidia/loop.py
   models/inkling2/nvidia/ops/attention_sm90.py

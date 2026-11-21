@@ -56,12 +56,81 @@ def _gemv_kernel(
 
 # sm_80 (Ampere): the same kernel beats cuBLAS at 5-16 rows on the GA100 too (cuBLAS picks split-K tiles
 # plus a reduce kernel there). Tiles measured per shape with the Inkling2 weights: (BN, BK, warps, stages).
-def _sm80_tiles(n: int) -> tuple[int, int, int, int]:
-    if n >= 65536:  # vocab heads
-        return 64, 256, 2, 4
+# Measured with cold weights (cycled past the 40 MB L2, as in the model).
+def _sm80_tiles(n: int, k: int) -> tuple[int, int, int, int]:
+    if n >= 65536:  # vocab heads; the draft's Markov fold has K=256
+        return (64, 64, 2, 3) if k <= 512 else (64, 256, 2, 4)
     if n <= 1024:
-        return 16, 128, 4, 3
+        return 16, 256, 2, 3
+    if n >= 16384:
+        return 64, 128, 8, 2
+    if n >= 8192:
+        return 64, 128, 4, 3
+    if k >= 3072:
+        return 32, 256, 4, 4
     return 32, 128, 4, 4
+
+
+@triton.jit
+def _seg3_gemv_kernel(X0, X1, X2, W, Y, M, K, SX0, SX1, SX2, SW, SY, N0, N1, N2, NB0, NB1,
+                      BN: tl.constexpr, BK: tl.constexpr, MP: tl.constexpr):
+    # Y[:, seg] = X_seg @ W[seg].T for three consecutive column segments (= weight rows) of widths N0, N1, N2.
+    pid = tl.program_id(0)
+    if pid < NB0:
+        X = X0
+        SX = SX0
+        lo = 0
+        hi = N0
+        local = pid
+    elif pid < NB0 + NB1:
+        X = X1
+        SX = SX1
+        lo = N0
+        hi = N0 + N1
+        local = pid - NB0
+    else:
+        X = X2
+        SX = SX2
+        lo = N0 + N1
+        hi = N0 + N1 + N2
+        local = pid - NB0 - NB1
+    cols = lo + local * BN + tl.arange(0, BN)
+    cmask = cols < hi
+    rows = tl.arange(0, MP)
+    acc = tl.zeros((MP, BN), tl.float32)
+    for k0 in range(0, K, BK):
+        ks = k0 + tl.arange(0, BK)
+        w = tl.load(W + cols[None, :].to(tl.int64) * SW + ks[:, None], cmask[None, :] & (ks[:, None] < K), other=0)
+        x = tl.load(X + rows[:, None] * SX + ks[None, :], (rows[:, None] < M) & (ks[None, :] < K), other=0)
+        acc += tl.dot(x, w)
+    tl.store(Y + rows[:, None] * SY + cols[None, :], acc.to(Y.dtype.element_ty), (rows[:, None] < M) & cmask[None, :])
+
+
+SEG3_TILES = (64, 128, 4, 3)
+
+
+def sm80_seg3_gemv(xs: tuple[torch.Tensor, torch.Tensor, torch.Tensor], weight: torch.Tensor,
+                   widths: tuple[int, int, int]) -> torch.Tensor | None:
+    """sm_80 (Ampere): one launch for `cat([xs[i] @ weight[seg_i].T])` over three consecutive weight-row segments
+    of `widths`, each with its own input (a full layer's or loop pass's q-side / k / v projections, three launches
+    otherwise). Returns bf16 (M, sum(widths)), or None where it does not apply."""
+    if not current_platform.is_device_capability_family(80) or weight.dtype != torch.bfloat16:
+        return None
+    m, k = xs[0].shape[0], weight.shape[1]
+    for x in xs:
+        if (x.ndim != 2 or x.dtype != torch.bfloat16 or x.shape != (m, k) or x.stride(-1) != 1
+                or x.device != weight.device):
+            return None
+    if not 0 < m <= MAX_M or weight.stride(-1) != 1 or weight.shape[0] < sum(widths):
+        return None
+    n = sum(widths)
+    out = torch.empty((m, n), device=weight.device, dtype=torch.bfloat16)
+    bn, bk, warps, stages = SEG3_TILES
+    nb = [triton.cdiv(w, bn) for w in widths]
+    _seg3_gemv_kernel[(sum(nb),)](xs[0], xs[1], xs[2], weight, out, m, k, xs[0].stride(0), xs[1].stride(0),
+        xs[2].stride(0), weight.stride(0), out.stride(0), *widths, nb[0], nb[1], BN=bn, BK=bk, MP=16,
+        num_warps=warps, num_stages=stages)
+    return out
 
 
 @triton.jit
@@ -158,7 +227,7 @@ def sm12x_bf16_gemv(
         out = torch.empty((m, n), device=x.device, dtype=out_dtype or x.dtype)
     bn, bk, warps, stages = _BN, _BK, 4, 3
     if not current_platform.is_device_capability_family(120):
-        bn, bk, warps, stages = _sm80_tiles(n)
+        bn, bk, warps, stages = _sm80_tiles(n, k)
     if m:
         _gemv_kernel[(triton.cdiv(n, bn),)](
             x2,

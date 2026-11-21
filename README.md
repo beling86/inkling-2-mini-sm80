@@ -58,7 +58,25 @@ draft tokens) with only the changes needed to run on sm_80. "Tuned" is this repo
 | Code, 1 / 8 users | 168 / 561 | **208-231 / 748** |
 | Prose, 1 / 8 users | 118 / 501 | **162 / 683** |
 
-Decode speed with a drafter depends on how predictable the text is: random words are the worst case, lists the best.
+### Why the kind of text matters
+
+Each step, the DSpark drafter guesses the next `K` tokens and the model checks them all in one pass. A step takes
+about the same time (~13.4 ms at k=4) however many guesses are right, so speed comes down to how predictable the text
+is:
+
+| Kind of text (k=4, temperature 0) | 1 user, tok/s | Tokens kept per step | 8 users, total tok/s |
+|---|---:|---:|---:|
+| Counting 1-200 | 300-340 | 4.4 of a possible 5 | |
+| Lists, structured text | 289 | ≈3.9 | 1,243 |
+| Code | 208-231 | ≈2.8-3.1 | 748 |
+| Chat answers | 187 | 2.5 | |
+| Prose | 162 | ≈2.2 | 683 |
+| Random words (worst case) | 139 | | |
+
+Tokens per step for counting and chat are measured; the others are tok/s × step time. Sampling at a higher
+temperature rejects more guesses than greedy decoding, so it is slower. That is also why the best `K` depends on the
+text: long runs of guesses come true when counting (k=7 is fastest there), while on chat, code and prose the later
+guesses rarely survive and checking them only costs time.
 
 **Draft length** (`K`), one user, all patches:
 

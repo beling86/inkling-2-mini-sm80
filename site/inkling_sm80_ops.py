@@ -1,7 +1,7 @@
-"""Stand-ins for compiled vLLM ops that vllm/vllm-openai:inkling-2-mini ships without sm_80 kernels.
+"""Stand-ins for compiled vLLM ops that vllm/vllm-openai:inkling-2-mini ships without sm_80 kernels (170HX), 21 Nov 2026.
 
 The image's _C / _C_cache_ops / _moe_C libraries carry sm_100 code for nearly everything (on sm_80 only Marlin and
-some MoE kernels exist), so such an op launches nothing on sm_80 and leaves cudaErrorNoKernelImageForDevice behind.
+some MoE kernels exist), so such an op launches nothing on a 170HX and leaves cudaErrorNoKernelImageForDevice behind.
 The image's vLLM commit is not public, so the libraries cannot be rebuilt; instead each op the Inkling 2 Mini path
 reaches is re-registered here for the CUDA dispatch key, so every caller (eager, torch.compile, CUDA graphs) gets it.
 Found with INKLING_SM80_TRACE=1 (sitecustomize): on start-up and decode only reshape_and_cache_flash (the DSpark
@@ -45,6 +45,72 @@ def reshape_and_cache_flash(key, value, key_cache, value_cache, slot_mapping, kv
         BLOCK_SIZE=key_cache.shape[1], D=dim, DP=triton.next_power_of_2(dim), num_warps=1)
 
 
+@triton.jit
+def _vocab_parallel_embedding_kernel(
+    Out,
+    Ids,
+    W,
+    out_t,
+    w_v,
+    org_start,
+    org_end,
+    add_start,
+    add_end,
+    add_offset,
+    D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    t = tl.program_id(0)
+    d_blk = tl.program_id(1)
+    tok = tl.load(Ids + t).to(tl.int64)
+    in_org = (tok >= org_start) & (tok < org_end)
+    in_add = (tok >= add_start) & (tok < add_end)
+    valid = in_org | in_add
+    row = tl.where(in_org, tok - org_start, tl.where(in_add, tok - add_offset, 0))
+    cols = d_blk * BLOCK_D + tl.arange(0, BLOCK_D)
+    cmask = cols < D
+    vals = tl.load(W + row * w_v + cols, mask=valid & cmask, other=0.0)
+    tl.store(Out + t * out_t + cols, vals, mask=cmask)
+
+
+def vocab_parallel_embedding(
+    out,
+    input_ids,
+    weight,
+    org_vocab_start_index,
+    org_vocab_end_index,
+    num_org_vocab_padding,
+    added_vocab_start_index,
+    added_vocab_end_index,
+):
+    n = input_ids.shape[0]
+    if n == 0:
+        return
+    d = weight.shape[1]
+    assert out.stride(1) == 1 and weight.stride(1) == 1
+    add_offset = (
+        int(added_vocab_start_index)
+        - (int(org_vocab_end_index) - int(org_vocab_start_index))
+        - int(num_org_vocab_padding)
+    )
+    block_d = 256
+    _vocab_parallel_embedding_kernel[(n, triton.cdiv(d, block_d))](
+        out,
+        input_ids,
+        weight,
+        out.stride(0),
+        weight.stride(0),
+        int(org_vocab_start_index),
+        int(org_vocab_end_index),
+        int(added_vocab_start_index),
+        int(added_vocab_end_index),
+        add_offset,
+        D=d,
+        BLOCK_D=block_d,
+        num_warps=4,
+    )
+
+
 _LIBS = []
 
 
@@ -52,4 +118,7 @@ def install():
     lib = torch.library.Library("_C_cache_ops", "IMPL")
     lib.impl("reshape_and_cache_flash", reshape_and_cache_flash, "CUDA")
     _LIBS.append(lib)  # keep the registration alive
-    print("[sm80] reshape_and_cache_flash -> Triton stand-in", flush=True)
+    lib_c = torch.library.Library("_C", "IMPL")
+    lib_c.impl("vocab_parallel_embedding", vocab_parallel_embedding, "CUDA")
+    _LIBS.append(lib_c)
+    print("[sm80] reshape_and_cache_flash + vocab_parallel_embedding -> Triton stand-ins", flush=True)

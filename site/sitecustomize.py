@@ -1,6 +1,6 @@
-"""Pre-Hopper (sm_80, Ampere) shims for the vllm/vllm-openai:inkling-2-mini image.
+"""Pre-Hopper (sm_80, CMP 170HX) shims for the vllm/vllm-openai:inkling-2-mini image, 21 Nov 2026.
 
-Loaded through PYTHONPATH only when INKLING_SM80=1 (run.sh sets both). The Inkling2 Triton kernels call Triton's
+Loaded through PYTHONPATH only when INKLING_SM80=1 (profile inkling2-mini). The Inkling2 Triton kernels call Triton's
 grid-dependency-control helpers (griddepcontrol.wait / launch_dependents) and are launched with launch_pdl=True:
 programmatic dependent launch, a Hopper feature. The PTX instructions do not exist before sm_90, so the kernels would
 not compile. Triton documents both helpers as safe no-ops when dependent launch is off, so here they become an empty
@@ -105,25 +105,58 @@ if os.environ.get("INKLING_SM80") == "1":
 
     class _Finder(importlib.abc.MetaPathFinder):
         def find_spec(self, name, path, target=None):
-            if name != "vllm._custom_ops":
+            if name not in ("vllm._custom_ops", "humming.jit.compiler"):
                 return None
             sys.meta_path.remove(self)
             spec = importlib.util.find_spec(name)
+            sys.meta_path.insert(0, self)
+            if spec is None or spec.loader is None:
+                return spec
             orig = spec.loader.exec_module
 
-            def exec_module(module):
-                orig(module)
-                try:
-                    import inkling_sm80_ops
-
-                    inkling_sm80_ops.install()
-                except Exception as e:
-                    print(f"[sm80] op stand-ins not installed: {e!r}", flush=True)
-                if os.environ.get("INKLING_SM80_TRACE") == "1":
+            if name == "vllm._custom_ops":
+                def exec_module(module):
+                    orig(module)
                     try:
-                        _install_trace()
+                        import inkling_sm80_ops
+
+                        inkling_sm80_ops.install()
                     except Exception as e:
-                        print(f"[sm80-trace] not installed: {e!r}", flush=True)
+                        print(f"[sm80] op stand-ins not installed: {e!r}", flush=True)
+                    if os.environ.get("INKLING_SM80_TRACE") == "1":
+                        try:
+                            _install_trace()
+                        except Exception as e:
+                            print(f"[sm80-trace] not installed: {e!r}", flush=True)
+            else:
+                def exec_module(module):
+                    orig(module)
+                    try:
+                        import glob
+                        import json
+
+                        patch_inc = os.path.join(os.path.dirname(os.path.abspath(__file__)), "humming_include")
+                        if os.path.isdir(patch_inc) and os.environ.get("INKLING_SM80_NO_FUSED_SITU") != "1":
+                            comp = module.Compiler
+                            orig_inc = comp.include_dirs
+                            orig_mt = comp.cuh_last_update_time
+
+                            @staticmethod
+                            def _patched_inc():
+                                return [patch_inc] + orig_inc()
+
+                            @staticmethod
+                            def _patched_mt():
+                                data = json.loads(orig_mt())
+                                for fn in sorted(glob.glob(f"{patch_inc}/**/*.cuh", recursive=True)):
+                                    data[fn] = os.stat(fn).st_mtime
+                                return json.dumps(data, ensure_ascii=False)
+
+                            comp.include_dirs = _patched_inc
+                            comp.cuh_last_update_time = _patched_mt
+                            print("[sm80] humming fused-SiTU epilogue header active", flush=True)
+                    except Exception as e:
+                        print(f"[sm80] humming include patch failed: {e!r}", flush=True)
 
             spec.loader.exec_module = exec_module
             return spec

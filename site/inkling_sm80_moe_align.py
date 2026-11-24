@@ -1,4 +1,4 @@
-"""moe_align_block_size for GPUs the image's compiled op does not cover (sm_80, Ampere).
+"""moe_align_block_size for GPUs the image's compiled op does not cover (170HX, sm_80), 21 Nov 2026.
 
 vllm/vllm-openai:inkling-2-mini builds _moe_C's moe_align_block_size kernels for sm_100 only: on sm_80 the op launches
 nothing and returns uninitialised buffers (cudaErrorNoKernelImageForDevice left pending, wrong routing). Same contract
@@ -41,7 +41,7 @@ def moe_align_block_size_torch(topk_ids: torch.Tensor, block_size: int, num_expe
     return sorted_ids, expert_ids, total.to(torch.int32)
 
 
-# One-kernel version for decode-sized batches: the torch version above is ~30 small kernels (~80 us a
+# One-kernel version for decode-sized batches (21 Nov 2026): the torch version above is ~30 small kernels (~80 us a
 # call on a 170HX), and it runs in each of the 48 MoE passes of a step (12 looped layers x 3 + 12), ~4 ms of a ~19 ms
 # step at 8 tokens. One program sorts (expert * BLOCK + row) keys in registers (stable by row), so this covers up to
 # _TRITON_MAX routed rows; bigger (prefill) batches keep the torch version.
@@ -85,6 +85,13 @@ def _moe_align_small_kernel(ids_ptr, sorted_ptr, expert_ids_ptr, total_ptr, nume
 def moe_align_block_size_fast(topk_ids: torch.Tensor, block_size: int, num_experts: int):
     numel = topk_ids.numel()
     if numel > _TRITON_MAX:
+        if num_experts <= 256 and topk_ids.dtype == torch.int32:
+            try:
+                from inkling_sm80_cuda import HAS_CUDA_EXT, moe_align_large_cuda
+                if HAS_CUDA_EXT:
+                    return moe_align_large_cuda(topk_ids, block_size, num_experts)
+            except Exception:
+                pass
         return moe_align_block_size_torch(topk_ids, block_size, num_experts)
     max_pad = numel + num_experts * (block_size - 1)
     if numel < num_experts:

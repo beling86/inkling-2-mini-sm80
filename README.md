@@ -4,11 +4,13 @@ Patches that let [thinkingmachines/Inkling-2-Mini](https://huggingface.co/thinki
 fast, on NVIDIA Ampere GPUs with vLLM.
 
 The model is served by vLLM's own image `vllm/vllm-openai:inkling-2-mini`. That image only supports Hopper and newer
-(compute capability 9.0+). This repository mounts a handful of patched files over it, plus a few Triton stand-ins.
-Nothing is compiled or installed, and the image itself is not modified.
+(compute capability 9.0+). This repository mounts patched files over it, plus Triton stand-ins for ops the image only
+ships for newer GPUs, and a small CUDA extension that `run.sh` compiles inside the same image on first start. The image
+itself is not modified.
 
 Tested on an NVIDIA CMP 170HX: a GA100 (the A100's chip), sm_80, 64 GB, power-capped at 180 W. It should behave the same
-on an A100 (also sm_80), but that is untested. Other Ampere chips (sm_86 / sm_89) are untested too.
+on an A100 (also sm_80), but that is untested. Other Ampere chips (sm_86 / sm_89) have less shared memory and are
+untested.
 
 ## Quick start
 
@@ -24,18 +26,23 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' -
   "chat_template_kwargs": {"reasoning_effort": "none"}}'
 ```
 
-The first start takes a few minutes while Triton compiles kernels. They are cached in `~/.cache/inkling2-sm80`, so
-later starts take about two minutes.
+The first start compiles the CUDA extension (about a minute) and then Triton kernels. Both are cached in
+`~/.cache/inkling2-sm80`, so later starts take about two minutes. A few kernels still compile the first time they meet a
+new prompt length, so the very first long prompt after a fresh install is slower, and the first time
+it serves a new number of users at once, one reply can start up to about 3 s late. Both happen once.
 
 `run.sh` takes its settings from environment variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `MODEL` | (required) | the downloaded model folder |
-| `GPU` | `0` | GPU index or UUID |
+| `GPU` | `0` | GPU index or UUID; two separated by a comma (`0,1`) split the model over both (tensor parallel) |
 | `PORT` / `BIND` | `8000` / `127.0.0.1` | where the OpenAI-compatible API listens. There is no API key, so only bind to `0.0.0.0` on a trusted network |
 | `K` | `4` | how many tokens the DSpark drafter proposes per step (1-7), see below |
 | `LEN` | `262144` | context length |
+| `BATCH` | `12288` | prompt tokens per prefill chunk |
+| `UTIL` | `0.96` (one GPU), `0.92` (two) | share of GPU memory vLLM may take; lower it if the GPU also drives a display or runs anything else |
+| `CACHE` | `~/.cache/inkling2-sm80` | compiled kernels |
 | `IMAGE` | the tested build, pinned by digest | the patches replace whole files of that build |
 | `NAME` | `inkling2-sm80` | container name, to run several at once |
 
@@ -46,50 +53,75 @@ off. Even then, as the model card notes, the model still reasons briefly.
 
 ## Results
 
-One CMP 170HX at 180 W, PCIe Gen2 x16, `reasoning_effort: "none"`. "Untuned" is the image's own settings (DSpark with 7
-draft tokens) with only the changes needed to run on sm_80. "Tuned" is this repository as it stands.
+One CMP 170HX at 180 W, PCIe Gen2 x16, DSpark k=4, `reasoning_effort: "none"`. v1 and v2 were measured side by side on
+24 Nov 2026, on two identical cards with the same scripts. Each server first ran a throwaway pass of every test, so no
+kernel was compiling during the measured run, and every measured prompt was new (no prefix-cache hits).
 
-| | Untuned | **Tuned (k=4)** |
+| | v1 | **v2** | Change |
+|---|---:|---:|---:|
+| Prompt processing tok/s, 8k / 32k / 128k / 262k | 7,109 / 6,622 / 5,056 / 3,788 | **9,001 / 8,483 / 6,307 / 4,674** | +23% to +28% |
+| Time to first token, 32k / 128k / 262k | 4.9 / 25.9 / 69.0 s | **3.9 / 20.8 / 55.9 s** | -19% to -22% |
+| Recipe prompts, one user: lists / code / prose (tok/s) | 294 / 212 / 164 | **315 / 246 / 177** | +7% / +16% / +8% |
+| Recipe prompts, 2 users (total tok/s) | 504 / 355 / 308 | **545 / 364 / 324** | +8% / +2% / +5% |
+| Recipe prompts, 4 users | 827 / 509 / 466 | **905 / 527 / 468** | +9% / +4% / 0% |
+| Recipe prompts, 8 users | 1,193 / 713 / 670 | **1,349 / 791 / 717** | +13% / +11% / +7% |
+| Recipe prefill test, 2k / 32k prompts (tok/s) | 6,339 / 6,676 | **7,962 / 8,607** | +26% / +29% |
+| Chat prompts, one user (tok/s; time per step) | 183; 13.5 ms | **194; 12.5 ms** | +6% |
+| Counting 1-200, one user | 302 | **324** | +7% |
+| 1k random-word prompts, 1 / 2 / 4 / 8 at once (total tok/s) | 143 / 207 / 312 / 456 | **150 / 227 / 343 / 501** | +5% to +10% |
+| Generation after a 32k / 128k / 262k prompt (tok/s) | 144 / 116 / 91 | 140 / 121 / 90 | level |
+
+The recipe prompts are the ones the published GLM and DeepSeek recipes for this card use: count 1-200 (lists), Python
+tasks (code) and a hash-map explanation (prose), 400 tokens at temperature 0, median of 5 runs; with several users the
+figure is the total of all of them. The last two rows sample at temperature 0.7, which makes the drafter's hit rate,
+and with it the speed, swing by about ±10% from run to run; generation after a long prompt is level between v1 and v2
+within that noise. Single runs otherwise vary by about ±5% for one user.
+
+**Two GPUs** (`GPU=0,1`, tensor parallel over a PCIe Gen2 x16 pair with peer-to-peer access), v2, measured once:
+
+| | One GPU | Two GPUs |
 |---|---:|---:|
-| Decode tok/s, random-word prompts, 1k / 32k / 128k / 262k | 105 / 97 / 78 / 62 | **144 / 140 / 120 / 90** |
-| Prefill tok/s, 8k / 32k / 128k / 262k | 4,008 / 6,219 / 3,994 / 2,700 | **7,264 / 6,802 / 5,146 / 3,913** |
-| Time to first token, 32k / 128k / 262k | 5.3 / 32.8 / 96.8 s | **4.8 / 25.5 / 66.8 s** |
-| Chat prompts, one user, greedy | 132 | **187** |
-| Lists and structured text, 1 / 8 users (total tok/s) | 259 / 1,094 | **289 / 1,243** |
-| Code, 1 / 8 users | 168 / 561 | **208-231 / 748** |
-| Prose, 1 / 8 users | 118 / 501 | **162 / 683** |
+| Recipe prompts, one user: lists / code / prose | 315 / 246 / 177 | 338 / 263 / 182 |
+| Recipe prompts, 8 users | 1,349 / 791 / 717 | 1,095 / 704 / 679 |
+| Chat prompts, one user (time per step) | 194 (12.5 ms) | 198 (11.7 ms) |
+| Counting 1-200, one user | 324 | 352 |
+| Prompt processing, 32k / 128k / 262k | 8,483 / 6,307 / 4,674 | 7,125 / 6,255 / 5,343 |
+| Time to first token at 262k | 55.9 s | 48.7 s |
+| Generation after a 262k prompt | 90 | 117 |
+| KV cache | 286,563 tokens | 418,253 tokens |
 
-Single runs vary by about ±5% for one user and ±10% for eight.
+Two GPUs help one user a little, very long prompts more, and hold half as much again of KV cache. With several users at
+once one GPU is faster, and two one-GPU servers serve twice as many.
 
 ### Why the kind of text matters
 
 Each step, the DSpark drafter guesses the next `K` tokens and the model checks them all in one pass. A step takes
-about the same time (~13 ms at k=4) however many guesses are right, so speed comes down to how predictable the text
+about the same time (about 12.5 ms at k=4) however many guesses are right, so speed comes down to how predictable the text
 is:
 
-| Kind of text (k=4, temperature 0) | 1 user, tok/s | Tokens kept per step | 8 users, total tok/s |
-|---|---:|---:|---:|
-| Counting 1-200 | 300-340 | 4.4 of a possible 5 | |
-| Lists, structured text | 289 | ≈3.9 | 1,243 |
-| Code | 208-231 | ≈2.8-3.1 | 748 |
-| Chat answers | 187 | 2.5 | |
-| Prose | 162 | ≈2.2 | 683 |
-| Random words (worst case) | 139 | | |
+| Kind of text (k=4, one user) | tok/s | Tokens kept per step |
+|---|---:|---:|
+| Counting 1-200 | 324 | 3.9 of a possible 5 |
+| Lists, structured text | 315 | |
+| Code | 246 | |
+| Chat answers | 194 | 2.4 |
+| Prose | 177 | |
+| Random words, temperature 0.7 | 150 | |
 
-Tokens per step for counting and chat are measured; the others are tok/s × step time. Sampling at a higher
-temperature rejects more guesses than greedy decoding, so it is slower. That is also why the best `K` depends on the
-text: long runs of guesses come true when counting (k=7 is fastest there), while on chat, code and prose the later
-guesses rarely survive and checking them only costs time.
+Sampling at a higher temperature rejects more guesses than greedy decoding, so it is slower. That is also why the best
+`K` depends on the text: long runs of guesses come true when counting (k=7 is fastest there), while on chat, code and
+prose the later guesses rarely survive and checking them only costs time. k=4 is the best all-rounder (on v1 against k=3, 5 and
+7; on v2 re-checked against k=5).
 
-**Draft length** (`K`), one user, all patches:
+## Output quality
 
-| | k=3 | **k=4** | k=5 | k=7 |
-|---|---:|---:|---:|---:|
-| Chat prompts / counting, tok/s | 177 / 264 | **187** / 303 | 176 / 315 | 172 / **361** |
-| ms per step | 13.0 | 13.4 | 14.6 | 15.4 |
-| Decode 1k / 32k / 128k | **145** / 133 / 112 | 141 / **140 / 119** | 126 / 130 / 102 | 135 / 128 / 97 |
+Every change keeps the same weights and the same maths; only the order of bf16 rounding differs. v2 against v1, same
+prompts, temperature 0:
 
-k=4 is the best all-rounder: chat, code, long context and several users. k=7 only wins on very predictable text.
+- Perplexity over 16,675 tokens of fixed text: mean negative log-likelihood 0.526 (v2) against 0.527 (v1).
+- 55 multi-step arithmetic word problems: 55 correct on both.
+- Greedy replies (28 prompts, 300 tokens): 7 identical, the rest identical up to a median of ~300 characters, after which
+  the wording drifts (e.g. "asks for description" against "asks to describe"), as it does with any change of kernels.
 
 ## What the patches do
 
@@ -98,53 +130,54 @@ k=4 is the best all-rounder: chat, code, long context and several users. k=7 onl
 - `quant_config.py`: lowers the minimum capability from 9.0 to 8.0. The experts already go through Humming (bf16 maths
   on NVFP4 / MXFP8 weights), which has sm_80 heuristics.
 - `ops/linear.py`, `ops/conv_mix.py`: the TMA linear kernel and the compiled conv/mix op are Hopper / Blackwell only.
-  On sm_80 they now take the code's existing SM12x branches, which are plain Triton.
+  On sm_80 they take the code's SM12x branches (plain Triton) or this repository's kernels.
 - `site/sitecustomize.py`: Triton's grid-dependency-control helpers (programmatic dependent launch, sm_90+) become
   empty, and launches run without PDL.
 - **Compiled ops without sm_80 kernels.** The image's `_C`, `_C_cache_ops` and `_moe_C` libraries are built for
   sm_100. On sm_80, an op with no kernel launches nothing and leaves `cudaErrorNoKernelImageForDevice` behind for some
-  later call to report, far from the cause. Two such ops matter here: `moe_align_block_size` (expert routing) and
-  `reshape_and_cache_flash` (the drafter's KV cache). Both now have Triton versions: `site/inkling_sm80_moe_align.py`,
-  wired in by `ops/moe_sm90.py`, and `site/inkling_sm80_ops.py`, registered at the PyTorch dispatcher. Set
-  `INKLING_SM80_TRACE=1` to wrap every compiled op and log the first one that leaves a CUDA error. That is how these
-  two were found.
+  later call to report, far from the cause. Three such ops matter here: `moe_align_block_size` (expert routing),
+  `reshape_and_cache_flash` (the drafter's KV cache) and, with two GPUs, `vocab_parallel_embedding`. All have
+  replacements in `site/`. Set `INKLING_SM80_TRACE=1` to wrap every compiled op and log the first one that leaves a CUDA
+  error.
 
-**Making it fast** (each change is exact up to the order of bf16 rounding):
+**Making it fast, v1** (21 Nov 2026):
 
-- `ops/moe_sm90.py`: Humming expert-GEMM tiles for decode-sized batches (`[8, 256, 128]`, 2 CTAs per SM), from a
-  192-config sweep; they run at memory bandwidth. Override with `INKLING_SM80_HUMMING='{"block_shape": [...], ...}'`.
-- `ops/gemv.py`: the image's own low-row Triton GEMV (written for SM12x) now handles every 1-16-row bf16 matmul on
-  sm_80 too, both vocab heads included, with tiles chosen per shape (measured with the weights cycled past the 40 MB
-  L2, as in the model; a sweep that reuses one weight picks tiles that only win from cache). cuBLAS picks split-K
-  kernels plus a reduce here: the output projection drops from 16 to 9 µs and the vocab head from 780 to 550 µs.
-- `attention.py` + `ops/gemv.py`: on loop passes (and in full-attention layers) the q-side, k and v projections each
-  read a different input, so they ran as three launches; the k and v ones (1024 rows) reached only a quarter of the
-  memory bandwidth. One launch now covers all three segments, each block reading its own input: 46 → 29 µs.
-- `dspark.py`: DSpark accepts fewer than 7 draft tokens (verifying fewer reads fewer distinct experts per step), and
-  the drafter's Markov correction, a 201k-row matmul per draft token, runs on the same gemv (84 → 71 µs a call).
-- `loop.py` + `ops/gemv.py`: the loop layers' message controllers run two batched matmuls. cuBLAS gave the first of
-  them (N=64, K=4608) one block per stream. Two Triton kernels now do the pair, with K split across blocks: 25 µs
-  becomes 10 µs.
-- `ops/attention_sm90.py`: in full-attention layers on long prompts, nearly every key block lies wholly beyond the
-  relative-position range, so its bias is zero and its mask is all-true. Those blocks now take a plain flash-attention
-  loop, which makes full-attention prefill 1.5-1.8x faster and long-context verification 1.3x faster. The prefill
-  tiles are retuned too: 32-key tiles for full layers, 64-key / 8 warps / 3 stages for window layers.
+- Humming expert-GEMM tiles for decode-sized batches, from a 192-config sweep (`ops/moe_sm90.py`).
+- Every small bf16 matmul, both vocab heads included, on the image's own low-row Triton GEMV with tiles chosen per
+  shape, measured with the weights cycled past the 40 MB L2 as in the model (`ops/gemv.py`). cuBLAS picks split-K
+  kernels plus a reduce here.
+- One launch for a loop pass's q-side, k and v projections (`attention.py`), two Triton kernels for the loop
+  controllers' batched matmuls (`loop.py`), the drafter's Markov correction on the GEMV (`dspark.py`).
+- Full-attention blocks wholly beyond the relative-position range skip the bias and mask (`ops/attention_sm90.py`).
 
-A decode step at k=4 takes about 13 ms: 4.9 ms of expert GEMMs (near memory bandwidth), 3.8 ms of dense matmuls (the
-vocab heads included), and about 4.3 ms over some 1,200 small kernels. Pre-Hopper GPUs have no programmatic dependent launch to
-overlap those. Prefill runs near the card's compute ceiling at 180 W. It slows with context because 8 full-attention
-passes per token (two of the four full layers are inside the loop) grow quadratically.
+**Making it fast, v2** (24 Nov 2026):
+
+- **A CUDA extension** (`csrc/inkling_sm80_cuda.cu`, loaded by `site/inkling_sm80_cuda.py`): the conv/mix step as one
+  kernel for decode and a two-pass kernel for prefill; MoE routing (top-k select fused with block alignment, and a
+  counting sort for long prefills); the loop controller's bank messages from rank-2 coefficients instead of a
+  full fp32 message tensor (much faster prefill, 300-450 MB less memory); the pair norm fused into the controller for
+  one-token decode; and five drafter kernels that replace some 80 small launches per step.
+- **Humming epilogue** (`site/humming_include/`): the expert activation (softcapped SwiGLU) and routing weight are
+  applied inside the first expert GEMM's epilogue, removing 48 launches per step. Expert tiles retuned for real
+  routing skew at 1-8 users and for 180 W prefill (`ops/moe_sm90.py`).
+- **Attention** (`ops/attention_sm90.py`, `ops/attention.py`, `ops/sconv.py`): far keys through FlashInfer and the
+  1,024 near keys (where the relative bias applies) through Triton; retuned local prefill and decode tiles.
+- **Small matmuls**: the Triton GEMV now also covers 17-64 rows (4-8 users) for the output projection and drafter
+  layers; cuBLAS for the controller's group partials on long prefills (`ops/gemv.py`, `ops/linear.py`, `loop.py`).
+- **Defaults**: 12,288-token prefill chunks and 96% of GPU memory (286,563 KV tokens, 1.09x a full 262k context).
+- **Two GPUs** work (tensor parallel), with `--disable-custom-all-reduce`.
+
+The v2 kernels were tuned with Neon.
 
 **Tried, no gain:**
 
 - int8 drafter weights: the in-kernel conversion costs more than the halved reads save.
 - W8A8 small matmuls: quantizing the activations costs more than it saves, and it changes outputs.
 - Marlin 4-bit: no sm_80 kernel in this image.
-- Adaptive draft verification: needs a confidence head the checkpoint does not have.
-- Fusing small kernels (the loop controller's four into one with grid barriers, the short conv with the mix after
-  it, the pair norm into the controller's matmul): each was slower, e.g. 25 µs against 20. A kernel boundary in a
-  CUDA graph costs about 1 µs here; these kernels are bound by chains of dependent memory reads, which separate
-  launches spread over more blocks.
+- Fusing chains of small kernels with grid barriers: slower; these kernels are bound by dependent memory reads.
+- A plain CUDA GEMV: 0.45-0.77x the Triton tensor-core GEMV.
+- FlashInfer's causal path beyond 64k of context, and a gated local-prefill epilogue: both slower.
+- 16,384-token prefill chunks: a full 262k context no longer fits.
 - A smaller draft vocabulary: saves up to ~0.7 ms a step, but rare tokens could no longer be drafted.
 
 `patches/sm80.diff` shows every change against the image's files. `tools/trace_kernels.py` sums kernel time from a
@@ -154,13 +187,13 @@ vLLM torch-profiler trace: start the server with `--profiler-config`, then POST 
 
 - Text only (`--language-model-only`); the vision tower has not been tried on sm_80.
 - The KV cache is bf16. The FP8 KV path in this code is SM12x only.
-- Outputs match the reference up to bf16 rounding order. Greedy answers agree, though wording can drift after a few
-  hundred tokens, as with any change of kernels.
+- Two GPUs were tested only as a peer-to-peer pair on PCIe Gen2 x16, with `--disable-custom-all-reduce`.
 - Made against the image build of 20 Nov 2026 (vLLM `0.1.dev25855+g7cb5dae22`). Expect to redo the patches when that
   image or upstream vLLM changes these files.
 
 ## Licence
 
 Apache-2.0, see `LICENSE`. The files under `patches/vllm/` are modified copies of vLLM source (Apache-2.0, copyright the
-vLLM contributors), and their SPDX headers are kept. `NOTICE` lists what was changed. The model weights are not part
-of this repository; Inkling 2 Mini is released by Thinking Machines under Apache-2.0.
+vLLM contributors), and their SPDX headers are kept. `site/humming_include/` holds a modified Humming header
+(Apache-2.0, copyright the Humming contributors). `NOTICE` lists what was changed. The model weights are not part of
+this repository; Inkling 2 Mini is released by Thinking Machines under Apache-2.0.

@@ -6,6 +6,7 @@ recurrent (`rnn_hidden`) Markov head. Numerics follow the reference
 implementation's draft (flashinfer RMSNorms, bf16 logits)."""
 
 from collections.abc import Iterable
+import os
 from typing import cast
 
 import torch
@@ -48,8 +49,28 @@ from .ops.dspark import (
     rope_,
     silu_and_mul,
 )
-from .ops.gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
+from .ops.gemv import (
+    sm12x_bf16_gemv,
+    sm80_draft_base_logits,
+    sm80_draft_dn_gemv,
+    use_sm12x_bf16_gemv,
+)
 from .ops.linear import linear
+
+try:
+    from inkling_sm80_cuda import HAS_CUDA_EXT as _SM80_HAS_CUDA
+    from inkling_sm80_cuda import (
+        draft_ctx_kv_cuda as _sm80_draft_ctx_kv,
+        draft_embed_block_cuda as _sm80_draft_embed_block,
+        draft_qk_norm_rope_cache_cuda as _sm80_draft_qk_norm_rope_cache,
+        markov_rnn_step_cuda as _sm80_markov_rnn_step,
+    )
+except Exception:
+    _SM80_HAS_CUDA = False
+    _sm80_draft_ctx_kv = None
+    _sm80_draft_embed_block = None
+    _sm80_draft_qk_norm_rope_cache = None
+    _sm80_markov_rnn_step = None
 
 
 class _RMSNorm(nn.Module):
@@ -197,28 +218,58 @@ class Inkling2DraftSelfAttention(nn.Module):
         self, positions: torch.Tensor, x: torch.Tensor, cos_sin_cache: torch.Tensor
     ) -> torch.Tensor:
         qkv = linear(x, self.qkv_proj.weight)
-        qk_norm_rope_(
-            qkv,
-            positions,
-            self.q_norm.weight,
-            self.k_norm.weight,
-            cos_sin_cache,
-            self.num_heads,
-            self.num_kv_heads,
-            self.eps,
-        )
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        out = q.new_zeros((q.shape[0], self.q_size))
         md = self._metadata()
+        out = qkv.new_zeros((qkv.shape[0], self.q_size))
         if md is not None:
-            self._write_kv(
-                k.view(-1, self.num_kv_heads, self.head_dim),
-                v.view(-1, self.num_kv_heads, self.head_dim),
-                md.slot_mapping[: q.shape[0]],
-            )
             key_cache, value_cache = self.attn.kv_cache.transpose(1, 2).split(
                 self.head_dim, dim=-1
             )
+            slot_map = md.slot_mapping[: qkv.shape[0]]
+            if (
+                _SM80_HAS_CUDA
+                and current_platform.is_device_capability_family(80)
+                and os.environ.get("INKLING_SM80_NO_CUDA_DSPARK") != "1"
+                and self.head_dim == 128
+                and qkv.dtype == torch.bfloat16
+                and key_cache.dtype == torch.bfloat16
+                and key_cache.stride(3) == 1
+                and value_cache.stride(3) == 1
+                and self.q_norm.weight.dtype == torch.bfloat16
+                and self.k_norm.weight.dtype == torch.bfloat16
+                and cos_sin_cache.dtype == torch.float32
+                and slot_map.dtype == torch.int64
+            ):
+                _sm80_draft_qk_norm_rope_cache(
+                    qkv,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    cos_sin_cache,
+                    positions,
+                    slot_map,
+                    key_cache,
+                    value_cache,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.eps,
+                )
+                q = qkv[:, : self.q_size]
+            else:
+                qk_norm_rope_(
+                    qkv,
+                    positions,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    cos_sin_cache,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.eps,
+                )
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                self._write_kv(
+                    k.view(-1, self.num_kv_heads, self.head_dim),
+                    v.view(-1, self.num_kv_heads, self.head_dim),
+                    slot_map,
+                )
             num_reqs = min(q.shape[0] // self.block, md.seq_lens.shape[0])
             num_tokens = num_reqs * self.block
             # The plan's 0 (FA4, for very large target batches) is one split
@@ -246,6 +297,17 @@ class Inkling2DraftSelfAttention(nn.Module):
                 window=self.window,
                 num_splits=num_splits,
             )
+        else:
+            qk_norm_rope_(
+                qkv,
+                positions,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                cos_sin_cache,
+                self.num_heads,
+                self.num_kv_heads,
+                self.eps,
+            )
         return linear(out, self.o_proj.weight)
 
     def store_context_kv(
@@ -255,9 +317,36 @@ class Inkling2DraftSelfAttention(nn.Module):
         cos_sin_cache: torch.Tensor,
         slot_mapping: torch.Tensor | None,
     ) -> None:
-        k, v = linear(context, self.kv_proj_ctx.weight).split(
-            [self.kv_size, self.kv_size], -1
-        )
+        kv_proj = linear(context, self.kv_proj_ctx.weight)
+        if slot_mapping is not None and self.attn.kv_cache.numel() > 0:
+            key_cache, value_cache = self.attn.kv_cache.transpose(1, 2).split(
+                self.head_dim, dim=-1
+            )
+            if (
+                _SM80_HAS_CUDA
+                and current_platform.is_device_capability_family(80)
+                and os.environ.get("INKLING_SM80_NO_CUDA_DSPARK") != "1"
+                and self.head_dim == 128
+                and kv_proj.dtype == torch.bfloat16
+                and key_cache.dtype == torch.bfloat16
+                and key_cache.stride(3) == 1
+                and value_cache.stride(3) == 1
+                and self.k_norm_ctx.weight.dtype == torch.bfloat16
+                and cos_sin_cache.dtype == torch.float32
+                and slot_mapping.dtype == torch.int64
+            ):
+                _sm80_draft_ctx_kv(
+                    kv_proj,
+                    self.k_norm_ctx.weight,
+                    cos_sin_cache,
+                    positions,
+                    slot_mapping,
+                    key_cache,
+                    value_cache,
+                    self.eps,
+                )
+                return
+        k, v = kv_proj.split([self.kv_size, self.kv_size], -1)
         k = self.k_norm_ctx(k.reshape(-1, self.head_dim))
         k = k.view(-1, self.num_kv_heads, self.head_dim)
         rope_(k, positions, cos_sin_cache)
@@ -285,6 +374,9 @@ class Inkling2DraftMLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = silu_and_mul(linear(x, self.gate_up_proj.weight))
+        out = sm80_draft_dn_gemv(x, self.down_proj.weight)
+        if out is not None:
+            return out
         return linear(x, self.down_proj.weight)
 
 
@@ -375,15 +467,42 @@ class Inkling2MarkovHead(nn.Module):
         )
         return out.view(hidden.shape[0], num_reqs, -1)
 
+    def step_latent(
+        self, state: torch.Tensor, prev_tokens: torch.Tensor, context: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Advance RNN state and return `(state, latent)` without projecting fold_weight."""
+        if (
+            _SM80_HAS_CUDA
+            and current_platform.is_device_capability_family(80)
+            and os.environ.get("INKLING_SM80_NO_CUDA_DSPARK") != "1"
+            and self.markov_rank == 256
+            and state.dtype == torch.bfloat16
+            and state.is_contiguous()
+            and context.dtype == torch.float32
+            and context.is_contiguous()
+            and self.rnn_proj.weight.dtype == torch.bfloat16
+            and self.rnn_proj.weight.stride(1) == 1
+            and self.markov_w1.weight.dtype == torch.bfloat16
+            and self.markov_w1.weight.is_contiguous()
+        ):
+            return _sm80_markov_rnn_step(
+                state,
+                prev_tokens,
+                self.markov_w1.weight,
+                self.rnn_proj.weight,
+                context,
+            )
+        inputs = torch.cat([state, self.markov_w1(prev_tokens)], dim=-1)
+        weight = self.rnn_proj.weight[:, : 2 * self.markov_rank]
+        raw = torch.addmm(context, inputs, weight.T, out_dtype=torch.float32)
+        return markov_gate(raw, state)
+
     def step(
         self, state: torch.Tensor, prev_tokens: torch.Tensor, context: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One recurrence step; returns the new state and the TP-local bias."""
         assert self.fold_weight is not None and self.fold_bias is not None
-        inputs = torch.cat([state, self.markov_w1(prev_tokens)], dim=-1)
-        weight = self.rnn_proj.weight[:, : 2 * self.markov_rank]
-        raw = torch.addmm(context, inputs, weight.T, out_dtype=torch.float32)
-        state, latent = markov_gate(raw, state)
+        state, latent = self.step_latent(state, prev_tokens, context)
         # sm_80 (Ampere): the (vocab, r) fold through the low-M gemv, ~15% faster than cuBLAS's kernel here.
         if current_platform.is_device_capability_family(80) and use_sm12x_bf16_gemv(
             latent, self.fold_weight, self.fold_bias
@@ -432,6 +551,28 @@ class Inkling2DSparkDecoder(nn.Module):
         """Normalized target embedding of each block's anchor, then masks."""
         assert self.embed_tokens is not None and self.embed_norm is not None
         block = self.config.draft_block_size
+        if (
+            _SM80_HAS_CUDA
+            and current_platform.is_device_capability_family(80)
+            and os.environ.get("INKLING_SM80_NO_CUDA_DSPARK") != "1"
+            and self.config.hidden_size == 2304
+            and get_tensor_model_parallel_world_size() == 1
+            and input_ids.is_contiguous()
+            and self.embed_tokens.weight.dtype == torch.bfloat16
+            and self.embed_tokens.weight.is_contiguous()
+            and self.embed_norm.weight.dtype == torch.bfloat16
+            and self.embed_norm.weight.is_contiguous()
+            and self.mask_embed.dtype == torch.bfloat16
+            and self.mask_embed.is_contiguous()
+        ):
+            return _sm80_draft_embed_block(
+                input_ids,
+                self.embed_tokens.weight,
+                self.embed_norm.weight[0],
+                self.mask_embed,
+                block,
+                self.embed_norm.eps,
+            )
         ids = input_ids.view(-1, block)
         x = self.mask_embed.expand(ids.shape[0], block, -1).clone()
         x[:, 0] = self.embed_norm(self.embed_tokens(ids[:, 0].contiguous()))
@@ -555,6 +696,9 @@ class Inkling2DSparkModel(nn.Module):
     def compute_base_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """TP-local bf16 base logits (bf16 GEMM, as the reference)."""
         assert self.lm_head is not None
+        out = sm80_draft_base_logits(hidden_states, self.lm_head.weight)
+        if out is not None:
+            return out
         return linear(hidden_states, self.lm_head.weight)
 
     def markov_step(

@@ -43,7 +43,7 @@ class Inkling2QuantConfig(QuantizationConfig):
 
     @classmethod
     def get_min_capability(cls) -> int:
-        # sm_80 (Ampere): the experts run on Humming (bf16 maths, NVFP4 / MXFP8 weights), which
+        # 170HX (GA100, sm_80), 21 Nov 2026: the experts run on Humming (bf16 maths, NVFP4 / MXFP8 weights), which
         # has sm_80 heuristics; the Hopper-only kernels are routed to the SM12x branches (linear.py, conv_mix.py).
         return 80
 

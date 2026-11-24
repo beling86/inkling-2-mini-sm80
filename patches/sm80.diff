@@ -1,14 +1,21 @@
 --- a/vllm/models/inkling2/nvidia/attention.py
 +++ b/vllm/models/inkling2/nvidia/attention.py
-@@ -59,6 +59,7 @@
+@@ -58,7 +58,13 @@
+     plan_decode_attention,
      rel_decode_attention,
  )
- from .ops.attention_sm90 import MODE_OUT_LSE, rel_attention
-+from .ops.gemv import sm80_seg3_gemv
+-from .ops.attention_sm90 import MODE_OUT_LSE, rel_attention
++from .ops.attention_sm90 import (
++    MODE_GATED,
++    MODE_OUT_LSE,
++    rel_attention,
++    rel_attention_full_hybrid,
++)
++from .ops.gemv import sm80_seg3_dyn_gemv, sm80_seg3_gemv
  from .ops.linear import linear
  from .ops.sconv import attention_prologue, shift_rel_proj
  from .sconv import K_STREAM, V_STREAM, Inkling2ShortConv, conv_metadata
-@@ -339,6 +340,15 @@
+@@ -339,6 +345,15 @@
              return list(projected.split(self.split_sizes, dim=-1)[:6])
          q_side, kv_size = sum(self.split_sizes[:4]), self.split_sizes[4]
          k_end = q_side + kv_size
@@ -24,9 +31,216 @@
          projected = linear(x_q, weight[: sum(self.q_side_splits)])
          k = linear(x_k, weight[q_side:k_end])
          v = linear(x_v, weight[k_end : k_end + kv_size])
+@@ -379,7 +394,39 @@
+         if self.is_local and x_k is None:
+             x_k = x_v = x_q
+         assert x_k is not None and x_v is not None
+-        q, r, gate, sinks, k, v = self._project(x_q, x_k, x_v)
++        k_dyn = v_dyn = None
++        if (
++            not self.is_local
++            and self.k_sconv.dynamic
++            and self.v_sconv.dynamic
++            and self.k_sconv.weight_proj.shape[1] < 2560
++            and not (x_k is x_q and x_v is x_q)
++        ):
++            q_side, kv_size = sum(self.split_sizes[:4]), self.split_sizes[4]
++            fused_dyn = sm80_seg3_dyn_gemv(
++                (x_q, x_k, x_v),
++                self.qkvr.weight,
++                (q_side, kv_size, kv_size),
++                self.k_sconv.weight_proj,
++                self.v_sconv.weight_proj,
++            )
++            if fused_dyn is not None:
++                fused, k_dyn, v_dyn = fused_dyn
++                k_end = q_side + kv_size
++                projected = fused[:, :q_side]
++                k, v = fused[:, q_side:k_end], fused[:, k_end : k_end + kv_size]
++                add_linear_lora(self.qkvr, projected, x_q, range(4))
++                add_linear_lora(self.qkvr, k, x_k, [4])
++                add_linear_lora(self.qkvr, v, x_v, [5])
++                q, r, gate, sinks = projected.split(self.split_sizes[:4], dim=-1)
++            else:
++                q, r, gate, sinks, k, v = self._project(x_q, x_k, x_v)
++                k_dyn = self.k_sconv.dynamic_taps(x_k)
++                v_dyn = self.v_sconv.dynamic_taps(x_v)
++        else:
++            q, r, gate, sinks, k, v = self._project(x_q, x_k, x_v)
++            k_dyn = self.k_sconv.dynamic_taps(x_k)
++            v_dyn = self.v_sconv.dynamic_taps(x_v)
+         output = torch.empty(gate.shape, dtype=q.dtype, device=q.device)
+         self._attention(
+             positions,
+@@ -389,8 +436,8 @@
+             sinks,
+             k,
+             v,
+-            self.k_sconv.dynamic_taps(x_k),
+-            self.v_sconv.dynamic_taps(x_v),
++            k_dyn,
++            v_dyn,
+             tau,
+             output,
+             pass_idx,
+@@ -588,33 +635,63 @@
+             num_splits=num_splits,
+         )
+ 
+-    def _fa4_attention(
++    def _sm80_prefill_attention_gated(
+         self,
+         md: FlashAttentionMetadata,
+         kv_cache: torch.Tensor,
+         q: torch.Tensor,
+         rel_logits: torch.Tensor,
+-        out: torch.Tensor,
+-        lse: torch.Tensor,
+-        num_splits: int,
+-        use_scheduler: bool,
++        gate: torch.Tensor,
++        sinks: torch.Tensor,
++        output: torch.Tensor,
+         num_decodes: int,
+     ) -> None:
+-        """FA4 for the requests after the first `num_decodes`."""
++        """sm_80 fused gated prefill attention writing bf16 directly into `output`."""
+         num_decode_tokens = md.num_decode_tokens if num_decodes else 0
+         nt = md.num_actual_tokens - num_decode_tokens
++        if nt <= 0:
++            output.zero_()
++            return
+         cu_seqlens_q = md.query_start_loc[num_decodes:]
+         if num_decodes:
+             cu_seqlens_q = cu_seqlens_q - num_decode_tokens
+         key_cache, value_cache = self._split_kv_cache(kv_cache)
+-        if not use_sm100_kernels():
++        handled = False
++        if (
++            not self.is_local
++            and not self.fp8_kv
++            and isinstance(md, Inkling2AttentionMetadata)
++        ):
++            handled = rel_attention_full_hybrid(
++                q[:nt],
++                kv_cache,
++                key_cache,
++                value_cache,
++                output[:nt],
++                None,
++                rel_logits,
++                gate[:nt],
++                sinks[:nt],
++                md=md,
++                num_decodes=num_decodes,
++                block_table=md.block_table[num_decodes:],
++                cache_seqlens=md.seq_lens[num_decodes:],
++                cu_seqlens_q=cu_seqlens_q,
++                q_lens_cpu=md.query_lens_cpu[num_decodes:],
++                seq_lens_cpu=md.seq_lens_cpu[num_decodes:],
++                max_query_len=md.max_query_len,
++                softmax_scale=self.scaling,
++            )
++        if not handled:
+             rel_attention(
+                 q[:nt],
+                 key_cache,
+                 value_cache,
+-                out,
+-                lse,
++                output[:nt],
++                None,
+                 rel_logits,
++                gate[:nt],
++                sinks[:nt],
+                 block_table=md.block_table[num_decodes:],
+                 cache_seqlens=md.seq_lens[num_decodes:],
+                 cu_seqlens_q=cu_seqlens_q,
+@@ -622,8 +699,72 @@
+                 softmax_scale=self.scaling,
+                 window=self.sliding_window if self.is_local else 0,
+                 num_splits=1,
+-                mode=MODE_OUT_LSE,
++                mode=MODE_GATED,
+             )
++        if nt < output.shape[0]:
++            output[nt:].zero_()
++
++    def _fa4_attention(
++        self,
++        md: FlashAttentionMetadata,
++        kv_cache: torch.Tensor,
++        q: torch.Tensor,
++        rel_logits: torch.Tensor,
++        out: torch.Tensor,
++        lse: torch.Tensor,
++        num_splits: int,
++        use_scheduler: bool,
++        num_decodes: int,
++    ) -> None:
++        """FA4 for the requests after the first `num_decodes`."""
++        num_decode_tokens = md.num_decode_tokens if num_decodes else 0
++        nt = md.num_actual_tokens - num_decode_tokens
++        cu_seqlens_q = md.query_start_loc[num_decodes:]
++        if num_decodes:
++            cu_seqlens_q = cu_seqlens_q - num_decode_tokens
++        key_cache, value_cache = self._split_kv_cache(kv_cache)
++        if not use_sm100_kernels():
++            handled = False
++            if (
++                not self.is_local
++                and not self.fp8_kv
++                and isinstance(md, Inkling2AttentionMetadata)
++            ):
++                handled = rel_attention_full_hybrid(
++                    q[:nt],
++                    kv_cache,
++                    key_cache,
++                    value_cache,
++                    out,
++                    lse,
++                    rel_logits,
++                    md=md,
++                    num_decodes=num_decodes,
++                    block_table=md.block_table[num_decodes:],
++                    cache_seqlens=md.seq_lens[num_decodes:],
++                    cu_seqlens_q=cu_seqlens_q,
++                    q_lens_cpu=md.query_lens_cpu[num_decodes:],
++                    seq_lens_cpu=md.seq_lens_cpu[num_decodes:],
++                    max_query_len=md.max_query_len,
++                    softmax_scale=self.scaling,
++                )
++            if not handled:
++                rel_attention(
++                    q[:nt],
++                    key_cache,
++                    value_cache,
++                    out,
++                    lse,
++                    rel_logits,
++                    block_table=md.block_table[num_decodes:],
++                    cache_seqlens=md.seq_lens[num_decodes:],
++                    cu_seqlens_q=cu_seqlens_q,
++                    max_query_len=md.max_query_len,
++                    softmax_scale=self.scaling,
++                    window=self.sliding_window if self.is_local else 0,
++                    num_splits=1,
++                    mode=MODE_OUT_LSE,
++                )
+             out[nt:].zero_()
+             lse[:, nt:].zero_()
+             return
 --- a/vllm/models/inkling2/nvidia/dspark.py
 +++ b/vllm/models/inkling2/nvidia/dspark.py
-@@ -28,6 +28,7 @@
+@@ -6,6 +6,7 @@
+ implementation's draft (flashinfer RMSNorms, bf16 logits)."""
+ 
+ from collections.abc import Iterable
++import os
+ from typing import cast
+ 
+ import torch
+@@ -28,6 +29,7 @@
  )
  from vllm.model_executor.layers.rotary_embedding import get_rope
  from vllm.model_executor.model_loader.weight_utils import default_weight_loader
@@ -34,18 +248,224 @@
  from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
  from vllm.v1.attention.backends.flash_attn import (
      FlashAttentionBackend,
-@@ -47,6 +48,7 @@
+@@ -47,8 +49,29 @@
      rope_,
      silu_and_mul,
  )
-+from .ops.gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
++from .ops.gemv import (
++    sm12x_bf16_gemv,
++    sm80_draft_base_logits,
++    sm80_draft_dn_gemv,
++    use_sm12x_bf16_gemv,
++)
  from .ops.linear import linear
  
++try:
++    from inkling_sm80_cuda import HAS_CUDA_EXT as _SM80_HAS_CUDA
++    from inkling_sm80_cuda import (
++        draft_ctx_kv_cuda as _sm80_draft_ctx_kv,
++        draft_embed_block_cuda as _sm80_draft_embed_block,
++        draft_qk_norm_rope_cache_cuda as _sm80_draft_qk_norm_rope_cache,
++        markov_rnn_step_cuda as _sm80_markov_rnn_step,
++    )
++except Exception:
++    _SM80_HAS_CUDA = False
++    _sm80_draft_ctx_kv = None
++    _sm80_draft_embed_block = None
++    _sm80_draft_qk_norm_rope_cache = None
++    _sm80_markov_rnn_step = None
++
  
-@@ -382,6 +384,11 @@
+ class _RMSNorm(nn.Module):
+     def __init__(self, hidden_size: int, eps: float) -> None:
+@@ -195,28 +218,58 @@
+         self, positions: torch.Tensor, x: torch.Tensor, cos_sin_cache: torch.Tensor
+     ) -> torch.Tensor:
+         qkv = linear(x, self.qkv_proj.weight)
+-        qk_norm_rope_(
+-            qkv,
+-            positions,
+-            self.q_norm.weight,
+-            self.k_norm.weight,
+-            cos_sin_cache,
+-            self.num_heads,
+-            self.num_kv_heads,
+-            self.eps,
+-        )
+-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+-        out = q.new_zeros((q.shape[0], self.q_size))
+         md = self._metadata()
++        out = qkv.new_zeros((qkv.shape[0], self.q_size))
+         if md is not None:
+-            self._write_kv(
+-                k.view(-1, self.num_kv_heads, self.head_dim),
+-                v.view(-1, self.num_kv_heads, self.head_dim),
+-                md.slot_mapping[: q.shape[0]],
+-            )
+             key_cache, value_cache = self.attn.kv_cache.transpose(1, 2).split(
+                 self.head_dim, dim=-1
+             )
++            slot_map = md.slot_mapping[: qkv.shape[0]]
++            if (
++                _SM80_HAS_CUDA
++                and current_platform.is_device_capability_family(80)
++                and os.environ.get("INKLING_SM80_NO_CUDA_DSPARK") != "1"
++                and self.head_dim == 128
++                and qkv.dtype == torch.bfloat16
++                and key_cache.dtype == torch.bfloat16
++                and key_cache.stride(3) == 1
++                and value_cache.stride(3) == 1
++                and self.q_norm.weight.dtype == torch.bfloat16
++                and self.k_norm.weight.dtype == torch.bfloat16
++                and cos_sin_cache.dtype == torch.float32
++                and slot_map.dtype == torch.int64
++            ):
++                _sm80_draft_qk_norm_rope_cache(
++                    qkv,
++                    self.q_norm.weight,
++                    self.k_norm.weight,
++                    cos_sin_cache,
++                    positions,
++                    slot_map,
++                    key_cache,
++                    value_cache,
++                    self.num_heads,
++                    self.num_kv_heads,
++                    self.eps,
++                )
++                q = qkv[:, : self.q_size]
++            else:
++                qk_norm_rope_(
++                    qkv,
++                    positions,
++                    self.q_norm.weight,
++                    self.k_norm.weight,
++                    cos_sin_cache,
++                    self.num_heads,
++                    self.num_kv_heads,
++                    self.eps,
++                )
++                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
++                self._write_kv(
++                    k.view(-1, self.num_kv_heads, self.head_dim),
++                    v.view(-1, self.num_kv_heads, self.head_dim),
++                    slot_map,
++                )
+             num_reqs = min(q.shape[0] // self.block, md.seq_lens.shape[0])
+             num_tokens = num_reqs * self.block
+             # The plan's 0 (FA4, for very large target batches) is one split
+@@ -244,6 +297,17 @@
+                 window=self.window,
+                 num_splits=num_splits,
+             )
++        else:
++            qk_norm_rope_(
++                qkv,
++                positions,
++                self.q_norm.weight,
++                self.k_norm.weight,
++                cos_sin_cache,
++                self.num_heads,
++                self.num_kv_heads,
++                self.eps,
++            )
+         return linear(out, self.o_proj.weight)
+ 
+     def store_context_kv(
+@@ -253,9 +317,36 @@
+         cos_sin_cache: torch.Tensor,
+         slot_mapping: torch.Tensor | None,
+     ) -> None:
+-        k, v = linear(context, self.kv_proj_ctx.weight).split(
+-            [self.kv_size, self.kv_size], -1
+-        )
++        kv_proj = linear(context, self.kv_proj_ctx.weight)
++        if slot_mapping is not None and self.attn.kv_cache.numel() > 0:
++            key_cache, value_cache = self.attn.kv_cache.transpose(1, 2).split(
++                self.head_dim, dim=-1
++            )
++            if (
++                _SM80_HAS_CUDA
++                and current_platform.is_device_capability_family(80)
++                and os.environ.get("INKLING_SM80_NO_CUDA_DSPARK") != "1"
++                and self.head_dim == 128
++                and kv_proj.dtype == torch.bfloat16
++                and key_cache.dtype == torch.bfloat16
++                and key_cache.stride(3) == 1
++                and value_cache.stride(3) == 1
++                and self.k_norm_ctx.weight.dtype == torch.bfloat16
++                and cos_sin_cache.dtype == torch.float32
++                and slot_mapping.dtype == torch.int64
++            ):
++                _sm80_draft_ctx_kv(
++                    kv_proj,
++                    self.k_norm_ctx.weight,
++                    cos_sin_cache,
++                    positions,
++                    slot_mapping,
++                    key_cache,
++                    value_cache,
++                    self.eps,
++                )
++                return
++        k, v = kv_proj.split([self.kv_size, self.kv_size], -1)
+         k = self.k_norm_ctx(k.reshape(-1, self.head_dim))
+         k = k.view(-1, self.num_kv_heads, self.head_dim)
+         rope_(k, positions, cos_sin_cache)
+@@ -283,6 +374,9 @@
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+         x = silu_and_mul(linear(x, self.gate_up_proj.weight))
++        out = sm80_draft_dn_gemv(x, self.down_proj.weight)
++        if out is not None:
++            return out
+         return linear(x, self.down_proj.weight)
+ 
+ 
+@@ -373,15 +467,47 @@
+         )
+         return out.view(hidden.shape[0], num_reqs, -1)
+ 
+-    def step(
++    def step_latent(
+         self, state: torch.Tensor, prev_tokens: torch.Tensor, context: torch.Tensor
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+-        """One recurrence step; returns the new state and the TP-local bias."""
+-        assert self.fold_weight is not None and self.fold_bias is not None
++        """Advance RNN state and return `(state, latent)` without projecting fold_weight."""
++        if (
++            _SM80_HAS_CUDA
++            and current_platform.is_device_capability_family(80)
++            and os.environ.get("INKLING_SM80_NO_CUDA_DSPARK") != "1"
++            and self.markov_rank == 256
++            and state.dtype == torch.bfloat16
++            and state.is_contiguous()
++            and context.dtype == torch.float32
++            and context.is_contiguous()
++            and self.rnn_proj.weight.dtype == torch.bfloat16
++            and self.rnn_proj.weight.stride(1) == 1
++            and self.markov_w1.weight.dtype == torch.bfloat16
++            and self.markov_w1.weight.is_contiguous()
++        ):
++            return _sm80_markov_rnn_step(
++                state,
++                prev_tokens,
++                self.markov_w1.weight,
++                self.rnn_proj.weight,
++                context,
++            )
+         inputs = torch.cat([state, self.markov_w1(prev_tokens)], dim=-1)
          weight = self.rnn_proj.weight[:, : 2 * self.markov_rank]
          raw = torch.addmm(context, inputs, weight.T, out_dtype=torch.float32)
-         state, latent = markov_gate(raw, state)
+-        state, latent = markov_gate(raw, state)
++        return markov_gate(raw, state)
++
++    def step(
++        self, state: torch.Tensor, prev_tokens: torch.Tensor, context: torch.Tensor
++    ) -> tuple[torch.Tensor, torch.Tensor]:
++        """One recurrence step; returns the new state and the TP-local bias."""
++        assert self.fold_weight is not None and self.fold_bias is not None
++        state, latent = self.step_latent(state, prev_tokens, context)
 +        # sm_80 (Ampere): the (vocab, r) fold through the low-M gemv, ~15% faster than cuBLAS's kernel here.
 +        if current_platform.is_device_capability_family(80) and use_sm12x_bf16_gemv(
 +            latent, self.fold_weight, self.fold_bias
@@ -54,7 +474,36 @@
          return state, torch.addmm(self.fold_bias, latent, self.fold_weight.T)
  
  
-@@ -465,11 +472,15 @@
+@@ -425,6 +551,28 @@
+         """Normalized target embedding of each block's anchor, then masks."""
+         assert self.embed_tokens is not None and self.embed_norm is not None
+         block = self.config.draft_block_size
++        if (
++            _SM80_HAS_CUDA
++            and current_platform.is_device_capability_family(80)
++            and os.environ.get("INKLING_SM80_NO_CUDA_DSPARK") != "1"
++            and self.config.hidden_size == 2304
++            and get_tensor_model_parallel_world_size() == 1
++            and input_ids.is_contiguous()
++            and self.embed_tokens.weight.dtype == torch.bfloat16
++            and self.embed_tokens.weight.is_contiguous()
++            and self.embed_norm.weight.dtype == torch.bfloat16
++            and self.embed_norm.weight.is_contiguous()
++            and self.mask_embed.dtype == torch.bfloat16
++            and self.mask_embed.is_contiguous()
++        ):
++            return _sm80_draft_embed_block(
++                input_ids,
++                self.embed_tokens.weight,
++                self.embed_norm.weight[0],
++                self.mask_embed,
++                block,
++                self.embed_norm.eps,
++            )
+         ids = input_ids.view(-1, block)
+         x = self.mask_embed.expand(ids.shape[0], block, -1).clone()
+         x[:, 0] = self.embed_norm(self.embed_tokens(ids[:, 0].contiguous()))
+@@ -465,11 +613,15 @@
          config = vllm_config.speculative_config.draft_model_config.hf_config
          assert isinstance(config, Inkling2DSparkConfig)
          num_spec = vllm_config.speculative_config.num_speculative_tokens
@@ -72,29 +521,86 @@
          if vllm_config.model_config.max_model_len > config.max_position_embeddings:
              raise ValueError(
                  "Inkling2 DSpark drafts up to max_position_embeddings="
+@@ -544,6 +696,9 @@
+     def compute_base_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         """TP-local bf16 base logits (bf16 GEMM, as the reference)."""
+         assert self.lm_head is not None
++        out = sm80_draft_base_logits(hidden_states, self.lm_head.weight)
++        if out is not None:
++            return out
+         return linear(hidden_states, self.lm_head.weight)
+ 
+     def markov_step(
 --- a/vllm/models/inkling2/nvidia/loop.py
 +++ b/vllm/models/inkling2/nvidia/loop.py
-@@ -28,6 +28,7 @@
+@@ -13,11 +13,13 @@
+ """
+ 
+ from collections.abc import Sequence
++import os
+ 
+ import torch
+ from torch import nn
+ 
+ from vllm.distributed import tensor_model_parallel_all_reduce
++from vllm.platforms import current_platform
+ 
+ from ..configs import Inkling2ModelConfig
+ from ..quant_config import Inkling2QuantConfig
+@@ -28,9 +30,27 @@
  )
  from .ops.attn_res import attn_res
  from .ops.linear import linear_k_groups
-+from .ops.gemv import sm80_controller_gain_forget
++from .ops.gemv import (
++    sm80_blend_rms_norm,
++    sm80_blend_rms_norm_rank2,
++    sm80_controller_gain_forget,
++)
  from .ops.loop import blend_rms_norm, pair_rms_norm
  from .sconv import conv_metadata
  
-@@ -121,12 +122,17 @@
++try:
++    from inkling_sm80_cuda import HAS_CUDA_EXT as _SM80_HAS_CUDA
++    from inkling_sm80_cuda import (
++        bank_rank2_finalize_cuda as _sm80_bank_rank2_finalize,
++        bank_stats_cuda as _sm80_bank_stats,
++        batched_bank_messages_cuda as _sm80_batched_bank_messages,
++    )
++except Exception:
++    _SM80_HAS_CUDA = False
++    _sm80_bank_rank2_finalize = None
++    _sm80_bank_stats = None
++    _sm80_batched_bank_messages = None
++
+ LOOP_STREAMS = ("attn", "k", "v", "mlp")
+ 
+ 
+@@ -120,15 +140,55 @@
+         """The `streams` controllers on fp32 `(S, T, D)` `dest` (may
          broadcast over streams) and `message`, each output RMS-normalized
          with its row of `norm_weight` `(S, D)`: bf16 `(S, T, D)`."""
-         pair = pair_rms_norm(dest, message)
+-        pair = pair_rms_norm(dest, message)
 -        hidden = torch.bmm(pair, self.controller_down[streams].transpose(1, 2))
 -        gain_forget = torch.bmm(
 -            hidden,
 -            self.controller_gain_forget[streams].transpose(1, 2),
 -            out_dtype=torch.float32,
-+        # sm_80 (Ampere): both products in two Triton kernels for decode-sized batches (ops/gemv.py).
++        # 170HX (sm_80): hybrid fused gain/forget+blend+CUDA rms_norm (halves HBM writes, M <= 64).
++        fused = sm80_blend_rms_norm(
++            dest,
++            message,
++            self.controller_down[streams],
++            self.controller_gain_forget[streams],
++            norm_weight,
++            norm_eps,
+         )
++        if fused is not None:
++            return fused
++        pair = pair_rms_norm(dest, message)
++        # 170HX (sm_80), 21 Nov 2026: both products in two Triton kernels for decode-sized batches (ops/gemv.py).
 +        gain_forget = sm80_controller_gain_forget(
 +            pair, self.controller_down[streams], self.controller_gain_forget[streams]
-         )
++        )
 +        if gain_forget is None:
 +            hidden = torch.bmm(pair, self.controller_down[streams].transpose(1, 2))
 +            gain_forget = torch.bmm(
@@ -104,17 +610,443 @@
 +            )
          return blend_rms_norm(dest, message, gain_forget, norm_weight, norm_eps)
  
++    def blend_rank2(
++        self,
++        streams: slice,
++        dest: torch.Tensor,
++        bank: torch.Tensor,
++        c_raw: torch.Tensor,
++        c_norm: torch.Tensor,
++        norm_weight: torch.Tensor,
++        norm_eps: float,
++    ) -> torch.Tensor:
++        """Rank-2 prefill blend directly from (bank, c_raw, c_norm) without fp32 message tensor."""
++        out = sm80_blend_rms_norm_rank2(
++            dest,
++            bank,
++            c_raw,
++            c_norm,
++            self.controller_down[streams],
++            self.controller_gain_forget[streams],
++            norm_weight,
++            norm_eps,
++        )
++        assert out is not None
++        return out
++
+ 
+ class Inkling2LoopModel(Inkling2Model):
+     seq_parallel_paths = False
+@@ -163,6 +223,7 @@
+             ),
+             persistent=False,
+         )
++        self._q_split_bf16_t: torch.Tensor | None = None
+ 
+     def process_weights_after_loading(self) -> None:
+         queries = self.middle_cycle_cross_pass_queries.view(-1, 2, self.hidden_size)
+@@ -174,6 +235,17 @@
+             (queries[:, 0], kv_queries[:, 0], kv_queries[:, 1], queries[:, 1]), 1
+         )
+         self.message_queries.copy_(stacked * self.hidden_size**-0.5)
++        self._q_split_bf16_t = None
++
++    def _get_q_split_bf16_t(self) -> torch.Tensor:
++        qt = self._q_split_bf16_t
++        if qt is None or qt.device != self.message_queries.device:
++            q_flat = self.message_queries.reshape(-1, self.hidden_size)
++            q_hi = q_flat.to(torch.bfloat16)
++            q_lo = (q_flat - q_hi.to(torch.float32)).to(torch.bfloat16)
++            qt = torch.cat((q_hi, q_lo), dim=0).t().contiguous()
++            self._q_split_bf16_t = qt
++        return qt
+ 
+     def _make_layer(
+         self,
+@@ -209,6 +281,8 @@
+         positions: torch.Tensor,
+         tau: torch.Tensor | None,
+         plan: list[tuple[bool, bool]],
++        precomputed_messages: torch.Tensor | None = None,
++        precomputed_rank2: tuple[torch.Tensor, torch.Tensor] | None = None,
+     ) -> tuple[int, torch.Tensor]:
+         """Run decoder layer `i` in loop pass `pass_idx` on its `inputs`
+         (the attention inputs; for a visit with messages from `bank`, the
+@@ -220,28 +294,38 @@
+         owner = layer.conv_states[pass_idx]
+         workspace = self.allreduce_workspace
+         (attn_fused, attn_two_shot), (moe_fused, moe_two_shot) = plan
++        has_msg = bank is not None
+         messages = None
+         attn_inputs: Sequence[torch.Tensor]
+         if bank is not None:
+             assert isinstance(layer, Inkling2LoopDecoderLayer) and inputs is not None
+-            # All four streams' messages: a mix of the bank's two blocks.
+-            messages = attn_res(
+-                bank[:1],
+-                bank[1],
+-                None,
+-                self.message_queries[i - self.loop_core.start],
+-                None,
+-                0.0,
+-                True,
+-            )
+             norm = layer.attn_norm
+             dests, norm_weight = inputs, norm.weight
+             if layer.is_local:
+                 dests = dests.expand(3, -1, -1)
+                 norm_weight = norm_weight.expand(3, -1)
+-            attn_inputs = layer.blend(
+-                slice(0, 3), dests, messages[:3], norm_weight, norm.eps
+-            )
++            if precomputed_rank2 is not None:
++                c_raw, c_norm = precomputed_rank2
++                attn_inputs = layer.blend_rank2(
++                    slice(0, 3), dests, bank, c_raw[:3], c_norm[:3], norm_weight, norm.eps
++                )
++            else:
++                # All four streams' messages: a mix of the bank's two blocks.
++                if precomputed_messages is not None:
++                    messages = precomputed_messages
++                else:
++                    messages = attn_res(
++                        bank[:1],
++                        bank[1],
++                        None,
++                        self.message_queries[i - self.loop_core.start],
++                        None,
++                        0.0,
++                        True,
++                    )
++                attn_inputs = layer.blend(
++                    slice(0, 3), dests, messages[:3], norm_weight, norm.eps
++                )
+         elif inputs is None:
+             assert num_blocks == 0
+             attn_inputs = [
+@@ -260,7 +344,7 @@
+             stack[: num_blocks + first],
+             None if first else partial,
+             self.attn_res.mlp_queries[i],
+-            None if messages is not None else layer.mlp_norm,
++            None if has_msg else layer.mlp_norm,
+         )
+         if attn_fused:
+             assert workspace is not None
+@@ -274,12 +358,19 @@
+         else:
+             attn_reduced = tensor_model_parallel_all_reduce(attn_partial)
+             mlp_in = layer.attn_sconv.conv_mix(attn_reduced, *mix_args, owner=owner)
+-        if messages is not None:
+-            assert isinstance(layer, Inkling2LoopDecoderLayer)
++        if has_msg:
++            assert isinstance(layer, Inkling2LoopDecoderLayer) and bank is not None
+             norm = layer.mlp_norm
+-            mlp_in = layer.blend(
+-                slice(3, 4), mlp_in, messages[3:], norm.weight, norm.eps
+-            )
++            if precomputed_rank2 is not None:
++                c_raw, c_norm = precomputed_rank2
++                mlp_in = layer.blend_rank2(
++                    slice(3, 4), mlp_in, bank, c_raw[3:], c_norm[3:], norm.weight, norm.eps
++                )
++            else:
++                assert messages is not None
++                mlp_in = layer.blend(
++                    slice(3, 4), mlp_in, messages[3:], norm.weight, norm.eps
++                )
+ 
+         # The MLP short conv also applies the residual update.
+         residual = None if first else partial
+@@ -343,7 +434,7 @@
+         aux_hidden_states = []
+         next_norm: nn.Module | None
+         num_blocks = 0
+-        inputs = bank = prelude_blocks = prelude_partial = prelude_dests = None
++        inputs = bank = pass_messages = pass_c_raw = pass_c_norm = prelude_blocks = prelude_partial = prelude_dests = None
+         for visit, (i, pass_idx) in enumerate(visits):
+             looped = pass_idx > 0
+             if i == core.start and not looped:
+@@ -355,6 +446,42 @@
+                 # the messages' bank.
+                 assert prelude_blocks is not None and prelude_partial is not None
+                 bank = stack[prelude_blocks + 1 : num_blocks + 1].clone()
++                pass_messages = None
++                pass_c_raw = None
++                pass_c_norm = None
++                if (
++                    _SM80_HAS_CUDA
++                    and current_platform.is_device_capability_family(80)
++                    and bank.shape[0] == 2
++                    and hidden == 2304
++                    and bank.dtype == torch.bfloat16
++                    and bank.stride(1) == 2304
++                    and bank.stride(2) == 1
++                    and self.message_queries.dtype == torch.float32
++                    and self.message_queries.is_contiguous()
++                ):
++                    if (
++                        num_tokens <= 256
++                        and os.environ.get("INKLING_SM80_NO_BATCHED_BANK") != "1"
++                    ):
++                        pass_messages = _sm80_batched_bank_messages(
++                            bank, self.message_queries, 1e-6
++                        )
++                    elif (
++                        num_tokens > 256
++                        and bank.is_contiguous()
++                        and os.environ.get("INKLING_SM80_NO_RANK2_BANK") != "1"
++                        and os.environ.get("INKLING_SM80_NO_HYBRID_BLEND") != "1"
++                    ):
++                        stats = _sm80_bank_stats(bank, 1e-6)
++                        dots = torch.mm(
++                            bank.view(2 * num_tokens, hidden),
++                            self._get_q_split_bf16_t(),
++                            out_dtype=torch.float32,
++                        )
++                        pass_c_raw, pass_c_norm = _sm80_bank_rank2_finalize(
++                            dots, stats, len(core), len(LOOP_STREAMS), 1e-6
++                        )
+                 num_blocks = prelude_blocks
+                 stack[num_blocks].copy_(prelude_partial)
+                 if prelude_dests is None:
+@@ -390,6 +517,10 @@
+                 positions,
+                 tau,
+                 plan,
++                pass_messages[i - core.start] if (looped and pass_messages is not None) else None,
++                (pass_c_raw[i - core.start], pass_c_norm[i - core.start])
++                if (looped and pass_c_raw is not None and pass_c_norm is not None)
++                else None,
+             )
+         assert inputs is not None
+         out = inputs[0]
+--- a/vllm/models/inkling2/nvidia/model.py
++++ b/vllm/models/inkling2/nvidia/model.py
+@@ -71,7 +71,7 @@
+ from .ops.allreduce import Inkling2AllReduceWorkspace
+ from .ops.attention import compute_log_scaling_tau
+ from .ops.attn_res import attn_res
+-from .ops.gemv import sm12x_bf16_gemv, use_sm12x_bf16_gemv
++from .ops.gemv import sm12x_bf16_gemv, sm80_lm_head_softcap, use_sm12x_bf16_gemv
+ from .ops.norm import rms_norm
+ from .ops.seq_parallel import SeqParallel
+ from .sconv import ATTN_STREAM, MLP_STREAM, Inkling2ShortConv, conv_metadata
+@@ -81,6 +81,44 @@
+ class Inkling2LogitsProcessor(LogitsProcessor):
+     """Use the low-M projection while preserving vocab gathering and softcaps."""
+ 
++    def forward(
++        self,
++        lm_head,
++        hidden_states: torch.Tensor,
++        embedding_bias: torch.Tensor | None = None,
++        skip_gather: bool = False,
++    ) -> torch.Tensor | None:
++        from vllm.model_executor.layers.linear import UnquantizedLinearMethod
++        from vllm.model_executor.layers.vocab_parallel_embedding import (
++            UnquantizedEmbeddingMethod,
++        )
++
++        if (
++            not self.logits_as_input
++            and self.head_dtype == torch.float32
++            and self.soft_cap is not None
++            and self.scale == 1.0
++            and (skip_gather or lm_head.tp_size == 1)
++            and isinstance(
++                lm_head.quant_method,
++                (UnquantizedEmbeddingMethod, UnquantizedLinearMethod),
++            )
++        ):
++            w_head = lm_head.weight
++            b_head = embedding_bias
++            if not skip_gather and lm_head.tp_size == 1 and w_head.shape[0] > self.org_vocab_size:
++                w_head = w_head[: self.org_vocab_size]
++                if b_head is not None:
++                    b_head = b_head[: self.org_vocab_size]
++            logits = sm80_lm_head_softcap(
++                hidden_states, w_head, b_head, float(self.soft_cap)
++            )
++            if logits is not None:
++                if not skip_gather and logits.shape[-1] > self.org_vocab_size:
++                    logits = logits[..., : self.org_vocab_size]
++                return logits
++        return super().forward(lm_head, hidden_states, embedding_bias, skip_gather)
++
+     def _apply_head(self, lm_head, hidden_states, embedding_bias):
+         from vllm.model_executor.layers.linear import UnquantizedLinearMethod
+         from vllm.model_executor.layers.vocab_parallel_embedding import (
+--- a/vllm/models/inkling2/nvidia/moe.py
++++ b/vllm/models/inkling2/nvidia/moe.py
+@@ -30,7 +30,7 @@
+ from .ops.block_scales import shuffle_rows, swizzle_block_scales
+ from .ops.moe import NUM_COUNTERS, combine, combine_push, route
+ from .ops.moe_humming import HummingNVFP4Experts
+-from .ops.moe_sm90 import HummingExperts, select_experts
++from .ops.moe_sm90 import HummingExperts, select_and_align_experts_sm80, select_experts
+ from .ops.moe_sm120 import bmm as bmm_sm120
+ from .ops.seq_parallel import SeqParallel
+ from .ops.trtllm_bmm import bmm, expert_plan, load_kernels
+@@ -300,6 +300,7 @@
+                 self.num_experts * self.ep_size,
+                 self.gate_cap,
+                 self.up_cap,
++                alignment_8=plan,
+             )
+         if push is not None:
+             # Each rank's fp32 combine is rounded once to bf16.
+@@ -383,6 +384,19 @@
+         if envs.VLLM_MOE_SKIP_PADDING and is_forward_context_available():
+             is_padding = get_forward_context().is_padding
+         if not (experts.sm100 or experts.sm120):
++            fused_sel = select_and_align_experts_sm80(
++                x,
++                gate.weight,
++                gate.bias,
++                gate.topk,
++                gate.route_scale,
++                experts.num_experts,
++                experts.ep_size,
++                is_padding,
++            )
++            if fused_sel is not None:
++                selected, align8 = fused_sel
++                return experts(x, selected, None, align8, reduce, push)
+             selected = select_experts(
+                 x,
+                 gate.weight,
+--- a/vllm/models/inkling2/nvidia/ops/attention.py
++++ b/vllm/models/inkling2/nvidia/ops/attention.py
+@@ -4,6 +4,7 @@
+ 
+ from dataclasses import dataclass
+ from functools import partial
++import os
+ from typing import Any
+ 
+ import numpy as np
+@@ -16,6 +17,7 @@
+     _num_warps_bucket,
+     bucket_max_seqlen_q,
+ )
++from vllm.platforms import current_platform
+ from vllm.triton_utils import gl, gluon, tl, tldevice, triton
+ from vllm.utils.platform_utils import num_compute_units
+ from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+@@ -399,7 +401,15 @@
+     if is_local:
+         if work <= (16 if max_query_len <= 2 else 8):
+             return triton.cdiv(rel_extent - 1, _FA4_BLOCK_N) + 1
++        if not current_platform.has_device_capability(90):
++            # 170HX (sm_80, 74 SMs): s=4 yields 128/256 CTAs (2-4 full waves) vs 96/128,
++            # cutting 4u/8u local decode from 35.1->30.5us and 49.0->43.8us (-0.21ms/step at 8u).
++            return 5 if work <= 16 else 4 if work <= 64 else 1
+         return 5 if work <= 16 else 3 if work <= 32 else 2 if work <= 64 else 1
++    if not current_platform.has_device_capability(90):
++        # 170HX (sm_80): target 2-4 waves of 74 SMs with BN=64 (1u: 18, 2u: 13, 4u/8u: 9).
++        cap = int(os.environ.get("INKLING_SM80_FULL_SPLITS", "18"))
++        return max(1, min(cap, max(cap if work <= 8 else (num_sms * 3 // work), 9 if work <= 64 else num_sms // work)))
+     return max(num_sms // work, min(num_sms // 8, 6 * num_sms // work))
+ 
  
 --- a/vllm/models/inkling2/nvidia/ops/attention_sm90.py
 +++ b/vllm/models/inkling2/nvidia/ops/attention_sm90.py
-@@ -150,7 +150,38 @@
+@@ -1,33 +1,48 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Inkling2 relative-bias paged attention for Hopper and SM12x (Triton).
++"""Inkling2 relative-bias paged attention for Ampere (sm_80), Hopper and SM12x.
+ 
+-Stands in for tml_fa4 (prefill) and the tcgen05 decode/verify kernel of
+-`ops/attention.py`, reading the same sheared relative logits of
+-`attention_prologue`: column `c` of token `t` holds key
+-`c + cdiv(past + tile_end, 128) * 128 - (E + 256)`, where `tile_end` ends
+-the token's 128-row query tile (see `qr_clip_rel_tokens`).
+-
+-A program owns `BLOCK_M` rows (tokens x GQA group) of one request and KV
+-head, and one KV split: split `s` of `S` takes key blocks `s, s + S, ...`
+-of the rows' visible range, so a split count that depends only on the batch
+-holds for every replay of a CUDA graph.
++sm_80 changes:
++1. Coalesced K load (`K + kv_ptrs[:, None] + offs_d[None, :]` + `tl.dot(q, tl.trans(k))`)
++   with V loaded after softmax: 1.43x faster 108k decode, 1.16x faster 240k decode,
++   up to 1.96x faster Triton prefill, bit-exact (md=0.0000).
++2. Local prefill (WINDOW > 0, MODE == 0) interior-block split (`_rel_attention_local_prefill_kernel`)
++   with BM=128, BN=32, w=4, st=4: skips masking on strictly interior window blocks -> 1.64x faster
++   across all 40 local layers (+44.7 ms/chunk at 8k, md<=1e-4).
++3. Full prefill (WINDOW == 0, MODE == 0) FlashInfer HND FAR + Triton NEAR hybrid
++   (`rel_attention_full_hybrid`): zero-copy real vLLM HND strides + zero extra merge kernel
++   (initializes Triton online softmax `(m_i, l_i, acc)` directly from FlashInfer `(lse_far, out_far)`),
++   plan cached on `md` across all 8 full layers -> 1.54x-2.04x faster (+103..+936 ms/chunk, md<=1.4e-4).
+ """
+ 
++import os
++from typing import Any
++
++import numpy as np
+ import torch
+ 
++from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ 
+-# The query tile of tml_fa4 that shears the relative logits.
+ _SHEAR_TILE = tl.constexpr(128)
+ 
+-# Output of `_rel_attention_kernel`: fp32 output and natural-log LSE (the
+-# tml_fa4 replacement), the gated bf16 output, or fp32 split partials with
+-# log2 LSEs (merged by `_rel_decode_combine_kernel`).
+ MODE_OUT_LSE = 0
+ MODE_GATED = 1
+ MODE_PARTIAL = 2
+ 
++_SM80_FI_WRAPPERS: dict[torch.device, Any] = {}
++
++
++def _get_sm80_fi_wrapper(device: torch.device):
++    w = _SM80_FI_WRAPPERS.get(device)
++    if w is None:
++        import flashinfer
++
++        ws = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=device)
++        w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, kv_layout="HND")
++        _SM80_FI_WRAPPERS[device] = w
++    return w
++
+ 
+ @triton.jit
+ def _sigmoid(x):
+@@ -36,7 +51,6 @@
+ 
+ @triton.jit
+ def _load_fp8_kv(ptr, offsets, mask, dtype: tl.constexpr, D: tl.constexpr):
+-    # Load each E4M3 pair once, retaining 16-bit packing for BF16 MMA order.
+     half = tl.arange(0, D // 2)
+     pair = tl.load(
+         ptr.to(tl.pointer_type(tl.uint16))
+@@ -124,8 +138,6 @@
+         pos = past + tok
+         pos_lo = past + first_tok
+         pos_hi = past + tl.minimum(first_tok + TOKENS, q_len) - 1
+-    # Visible key blocks of the tile, split `split` taking every
+-    # `num_splits`-th of them.
+     n_lo = 0
+     if WINDOW > 0:
+         n_lo = tl.maximum(pos_lo - (WINDOW - 1), 0) // BLOCK_N
+@@ -134,6 +146,7 @@
+     num_iters = tl.maximum(n_hi - n_lo - split + num_splits - 1, 0) // num_splits
+ 
+     offs_d = tl.arange(0, D)
++    offs_n = tl.arange(0, BLOCK_N)
+     q = tl.load(
+         Q + token[:, None] * stride_q_t + head[:, None] * stride_q_h + offs_d[None, :],
+         mask=row_valid[:, None],
+@@ -150,23 +163,53 @@
      acc = tl.zeros([BLOCK_M, D], tl.float32)
      block_table = BlockTable + req.to(tl.int64) * stride_bt
      kv_off = kv_head * stride_kv_h
 -    for i in range(num_iters):
-+    # sm_80 (Ampere): key blocks wholly at distance >= E from every row of the tile (full layers, long prompts:
-+    # nearly all of them) are fully visible and get no relative bias, so they skip the distance, mask and bias work.
-+    # Same values as the general loop below (its bias is 0 and its mask all-true there).
++
 +    num_far = 0
 +    if WINDOW == 0 and not DRAFT:
 +        far_hi = (pos_lo - E + 1) // BLOCK_N
@@ -122,17 +1054,19 @@
 +            tl.maximum(far_hi - n_lo - split + num_splits - 1, 0) // num_splits, num_iters
 +        )
 +    for i in range(num_far):
-+        n = n_lo + split + i * num_splits
-+        keys = n * BLOCK_N + tl.arange(0, BLOCK_N)
+         n = n_lo + split + i * num_splits
+-        keys = n * BLOCK_N + tl.arange(0, BLOCK_N)
++        keys = n * BLOCK_N + offs_n
 +        page = tl.load(block_table + keys // PAGE)
 +        kv_ptrs = (
 +            page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
 +        )
 +        if K.dtype.element_ty.primitive_bitwidth == 8:
-+            k = _load_fp8_kv(K, kv_ptrs, keys >= 0, q.dtype, D).T
++            k = _load_fp8_kv(K, kv_ptrs, keys >= 0, q.dtype, D)
 +        else:
-+            k = tl.load(K + kv_ptrs[None, :] + offs_d[:, None]).to(q.dtype)
-+        s = tl.dot(q, k) * qk_scale
++            # Coalesced 128-bit load along D (stride_d=1), evict_first so long-ctx KV doesn't thrash L2.
++            k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], eviction_policy="evict_first").to(q.dtype)
++        s = tl.dot(q, tl.trans(k)) * qk_scale
 +        m_new = tl.maximum(m_i, tl.max(s, 1))
 +        alpha = tl.exp2(m_i - m_new)
 +        p = tl.exp2(s - m_new[:, None])
@@ -140,30 +1074,996 @@
 +        if V.dtype.element_ty.primitive_bitwidth == 8:
 +            v = _load_fp8_kv(V, kv_ptrs, keys >= 0, q.dtype, D)
 +        else:
-+            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++            v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], eviction_policy="evict_first").to(q.dtype)
 +        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
 +        m_i = m_new
 +    for i in range(num_far, num_iters):
-         n = n_lo + split + i * num_splits
-         keys = n * BLOCK_N + tl.arange(0, BLOCK_N)
++        n = n_lo + split + i * num_splits
++        keys = n * BLOCK_N + offs_n
          key_valid = keys < seqlen_k
-@@ -337,7 +368,10 @@
+         page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
+         kv_ptrs = (
+             page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
+         )
+         if K.dtype.element_ty.primitive_bitwidth == 8:
+-            k = _load_fp8_kv(K, kv_ptrs, key_valid, q.dtype, D).T
++            k = _load_fp8_kv(K, kv_ptrs, key_valid, q.dtype, D)
+         else:
+             k = tl.load(
+-                K + kv_ptrs[None, :] + offs_d[:, None],
+-                mask=key_valid[None, :],
++                K + kv_ptrs[:, None] + offs_d[None, :],
++                mask=key_valid[:, None],
+                 other=0.0,
+             ).to(q.dtype)
+-        s = tl.dot(q, k) * qk_scale
++        s = tl.dot(q, tl.trans(k)) * qk_scale
+         dist = pos[:, None] - keys[None, :]
+         visible = (dist >= 0) & key_valid[None, :]
+         if WINDOW > 0:
+@@ -231,6 +274,825 @@
+         tl.store(Out + part[:, None] * D + offs_d[None, :], o, mask=row_valid[:, None])
+ 
+ 
++@triton.jit
++def _rel_attention_local_prefill_kernel(
++    Q,
++    K,
++    V,
++    Rel,
++    BlockTable,
++    SeqLens,
++    CuSeqlensQ,
++    Out,
++    Lse,
++    softmax_scale,
++    stride_q_t,
++    stride_q_h,
++    stride_kv_blk,
++    stride_kv_slot,
++    stride_kv_h,
++    stride_rel_t,
++    stride_bt,
++    stride_out_t,
++    stride_out_h,
++    stride_lse_h,
++    stride_lse_t,
++    H: tl.constexpr,
++    G: tl.constexpr,
++    D: tl.constexpr,
++    E: tl.constexpr,
++    PAGE: tl.constexpr,
++    WINDOW: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++):
++    """sm_80 fast local-window prefill kernel: splits [n_lo, n_hi) into left boundary,
++    strictly-interior unmasked blocks, and right boundary (zero-spill OUT_LSE)."""
++    TOKENS: tl.constexpr = BLOCK_M // G
++    E_PAD: tl.constexpr = E + 256
++    LOG2E: tl.constexpr = 1.4426950408889634
++    m_tile = tl.program_id(0)
++    kv_head = tl.program_id(1)
++    req = tl.program_id(2)
++    q_start = tl.load(CuSeqlensQ + req)
++    q_len = tl.load(CuSeqlensQ + req + 1) - q_start
++    first_tok = m_tile * TOKENS
++    if first_tok >= q_len:
++        return
++    seqlen_k = tl.load(SeqLens + req)
++    past = seqlen_k - q_len
++
++    rows = tl.arange(0, BLOCK_M)
++    tok = first_tok + rows // G
++    row_valid = (rows < TOKENS * G) & (tok < q_len)
++    head = kv_head * G + rows % G
++    token = (q_start + tok).to(tl.int64)
++    pos = past + tok
++    pos_lo = past + first_tok
++    pos_hi = past + tl.minimum(first_tok + TOKENS, q_len) - 1
++
++    n_lo = tl.maximum(pos_lo - (WINDOW - 1), 0) // BLOCK_N
++    n_hi = (tl.minimum(pos_hi + 1, seqlen_k) + BLOCK_N - 1) // BLOCK_N
++
++    offs_d = tl.arange(0, D)
++    offs_n = tl.arange(0, BLOCK_N)
++    q = tl.load(
++        Q + token[:, None] * stride_q_t + head[:, None] * stride_q_h + offs_d[None, :],
++        mask=row_valid[:, None],
++        other=0.0,
++    )
++    tile_end = tl.minimum((tok // _SHEAR_TILE + 1) * _SHEAR_TILE, q_len)
++    rel_base = (past + tile_end + 127) // 128 * 128 - E_PAD
++    rel_row = Rel + token * stride_rel_t + head * E_PAD - rel_base
++
++    qk_scale = softmax_scale * LOG2E
++    m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
++    l_i = tl.zeros([BLOCK_M], tl.float32)
++    acc = tl.zeros([BLOCK_M, D], tl.float32)
++    block_table = BlockTable + req.to(tl.int64) * stride_bt
++    kv_off = kv_head * stride_kv_h
++
++    int_lo = tl.maximum(n_lo, tl.cdiv(tl.maximum(pos_hi - (WINDOW - 1), 0), BLOCK_N))
++    int_hi = tl.minimum(n_hi, (pos_lo + 1) // BLOCK_N)
++    int_hi = tl.maximum(int_hi, int_lo)
++    int_lo = tl.minimum(int_lo, n_hi)
++
++    for n in range(n_lo, int_lo):
++        keys = n * BLOCK_N + offs_n
++        key_valid = keys < seqlen_k
++        page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
++        kv_ptrs = (
++            page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
++        )
++        k = tl.load(
++            K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
++        ).to(q.dtype)
++        s = tl.dot(q, tl.trans(k)) * qk_scale
++        dist = pos[:, None] - keys[None, :]
++        visible = (dist >= 0) & (dist < WINDOW) & key_valid[None, :]
++        bias = tl.load(
++            rel_row[:, None] + keys[None, :], mask=visible & row_valid[:, None], other=0.0
++        )
++        s = tl.where(visible, s + bias.to(tl.float32) * LOG2E, float("-inf"))
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
++        alpha = tl.exp2(m_i - m_safe)
++        p = tl.exp2(s - m_safe[:, None])
++        l_i = l_i * alpha + tl.sum(p, 1)
++        v = tl.load(
++            V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
++        ).to(q.dtype)
++        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
++        m_i = m_new
++
++    for n in range(int_lo, int_hi):
++        keys = n * BLOCK_N + offs_n
++        page = tl.load(block_table + keys // PAGE)
++        kv_ptrs = (
++            page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
++        )
++        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++        s = tl.dot(q, tl.trans(k)) * qk_scale
++        bias = tl.load(
++            rel_row[:, None] + keys[None, :], mask=row_valid[:, None], other=0.0
++        )
++        s += bias.to(tl.float32) * LOG2E
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        alpha = tl.exp2(m_i - m_new)
++        p = tl.exp2(s - m_new[:, None])
++        l_i = l_i * alpha + tl.sum(p, 1)
++        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
++        m_i = m_new
++
++    for n in range(int_hi, n_hi):
++        keys = n * BLOCK_N + offs_n
++        key_valid = keys < seqlen_k
++        page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
++        kv_ptrs = (
++            page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
++        )
++        k = tl.load(
++            K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
++        ).to(q.dtype)
++        s = tl.dot(q, tl.trans(k)) * qk_scale
++        dist = pos[:, None] - keys[None, :]
++        visible = (dist >= 0) & (dist < WINDOW) & key_valid[None, :]
++        bias = tl.load(
++            rel_row[:, None] + keys[None, :], mask=visible & row_valid[:, None], other=0.0
++        )
++        s = tl.where(visible, s + bias.to(tl.float32) * LOG2E, float("-inf"))
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
++        alpha = tl.exp2(m_i - m_safe)
++        p = tl.exp2(s - m_safe[:, None])
++        l_i = l_i * alpha + tl.sum(p, 1)
++        v = tl.load(
++            V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0
++        ).to(q.dtype)
++        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
++        m_i = m_new
++
++    empty = l_i == 0.0
++    o = acc / tl.where(empty, 1.0, l_i)[:, None]
++    lse2 = tl.where(empty, float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
++    tl.store(
++        Out + token[:, None] * stride_out_t + head[:, None] * stride_out_h + offs_d[None, :],
++        o,
++        mask=row_valid[:, None],
++    )
++    tl.store(
++        Lse + head * stride_lse_h + token * stride_lse_t,
++        lse2 * 0.6931471805599453,
++        mask=row_valid,
++    )
++
++
++@triton.jit
++def _rel_attention_near_kernel(
++    Q,
++    K,
++    V,
++    Rel,
++    BlockTable,
++    SeqLens,
++    CuSeqlensQ,
++    FarLens,
++    FarOut,
++    FarLse,
++    Out,
++    Lse,
++    softmax_scale,
++    stride_q_t,
++    stride_q_h,
++    stride_kv_blk,
++    stride_kv_slot,
++    stride_kv_h,
++    stride_rel_t,
++    stride_bt,
++    stride_fo_t,
++    stride_fo_h,
++    stride_fl_t,
++    stride_fl_h,
++    stride_out_t,
++    stride_out_h,
++    stride_lse_h,
++    stride_lse_t,
++    H: tl.constexpr,
++    G: tl.constexpr,
++    D: tl.constexpr,
++    E: tl.constexpr,
++    PAGE: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++):
++    """v5b Triton 4-interval interior-split NEAR kernel for full layers (WINDOW=0),
++    initialized directly from FlashInfer (FarOut, FarLse) with zero extra register pressure."""
++    TOKENS: tl.constexpr = BLOCK_M // G
++    E_PAD: tl.constexpr = E + 256
++    LOG2E: tl.constexpr = 1.4426950408889634
++    m_tile = tl.program_id(0)
++    kv_head = tl.program_id(1)
++    req = tl.program_id(2)
++    q_start = tl.load(CuSeqlensQ + req)
++    q_len = tl.load(CuSeqlensQ + req + 1) - q_start
++    first_tok = m_tile * TOKENS
++    if first_tok >= q_len:
++        return
++    seqlen_k = tl.load(SeqLens + req)
++    past = seqlen_k - q_len
++
++    rows = tl.arange(0, BLOCK_M)
++    tok = first_tok + rows // G
++    row_valid = (rows < TOKENS * G) & (tok < q_len)
++    head = kv_head * G + rows % G
++    token = (q_start + tok).to(tl.int64)
++    pos = past + tok
++    pos_lo = past + first_tok
++    pos_hi = past + tl.minimum(first_tok + TOKENS, q_len) - 1
++
++    offs_d = tl.arange(0, D)
++    offs_n = tl.arange(0, BLOCK_N)
++    q = tl.load(
++        Q + token[:, None] * stride_q_t + head[:, None] * stride_q_h + offs_d[None, :],
++        mask=row_valid[:, None],
++        other=0.0,
++    )
++    tile_end = tl.minimum((tok // _SHEAR_TILE + 1) * _SHEAR_TILE, q_len)
++    rel_base = (past + tile_end + 127) // 128 * 128 - E_PAD
++    rel_row = Rel + token * stride_rel_t + head * E_PAD - rel_base
++
++    qk_scale = softmax_scale * LOG2E
++    far_len_tile = tl.load(FarLens + (q_start + first_tok).to(tl.int64))
++    if far_len_tile > 0:
++        n_lo = far_len_tile // BLOCK_N
++        flse = tl.load(
++            FarLse + token * stride_fl_t + head * stride_fl_h,
++            mask=row_valid,
++            other=float("-inf"),
++        ).to(tl.float32)
++        fout = tl.load(
++            FarOut + token[:, None] * stride_fo_t + head[:, None] * stride_fo_h + offs_d[None, :],
++            mask=row_valid[:, None],
++            other=0.0,
++        ).to(tl.float32)
++        m_i = flse
++        l_i = tl.where(row_valid & (flse > float("-inf")), 1.0, 0.0)
++        acc = fout
++    else:
++        n_lo = 0
++        m_i = tl.full([BLOCK_M], float("-inf"), tl.float32)
++        l_i = tl.zeros([BLOCK_M], tl.float32)
++        acc = tl.zeros([BLOCK_M, D], tl.float32)
++
++    n_hi = (tl.minimum(pos_hi + 1, seqlen_k) + BLOCK_N - 1) // BLOCK_N
++    block_table = BlockTable + req.to(tl.int64) * stride_bt
++    kv_off = kv_head * stride_kv_h
++
++    far_hi = tl.minimum(n_hi, tl.maximum(n_lo, (pos_lo - E + 1) // BLOCK_N))
++    int_lo = tl.minimum(n_hi, tl.maximum(far_hi, tl.cdiv(tl.maximum(pos_hi - (E - 1), 0), BLOCK_N)))
++    int_hi = tl.maximum(int_lo, tl.minimum(n_hi, (pos_lo + 1) // BLOCK_N))
++
++    for n in range(n_lo, far_hi):
++        keys = n * BLOCK_N + offs_n
++        page = tl.load(block_table + keys // PAGE)
++        kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
++        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++        s = tl.dot(q, tl.trans(k)) * qk_scale
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        alpha = tl.exp2(m_i - m_new)
++        p = tl.exp2(s - m_new[:, None])
++        l_i = l_i * alpha + tl.sum(p, 1)
++        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
++        m_i = m_new
++
++    for n in range(far_hi, int_lo):
++        keys = n * BLOCK_N + offs_n
++        key_valid = keys < seqlen_k
++        page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
++        kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
++        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
++        s = tl.dot(q, tl.trans(k)) * qk_scale
++        dist = pos[:, None] - keys[None, :]
++        visible = (dist >= 0) & key_valid[None, :]
++        in_extent = visible & (dist < E) & row_valid[:, None]
++        bias = tl.load(rel_row[:, None] + keys[None, :], mask=in_extent, other=0.0)
++        s = tl.where(visible, s + bias.to(tl.float32) * LOG2E, float("-inf"))
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
++        alpha = tl.exp2(m_i - m_safe)
++        p = tl.exp2(s - m_safe[:, None])
++        l_i = l_i * alpha + tl.sum(p, 1)
++        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
++        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
++        m_i = m_new
++
++    for n in range(int_lo, int_hi):
++        keys = n * BLOCK_N + offs_n
++        page = tl.load(block_table + keys // PAGE)
++        kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
++        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++        s = tl.dot(q, tl.trans(k)) * qk_scale
++        bias = tl.load(rel_row[:, None] + keys[None, :], mask=row_valid[:, None], other=0.0)
++        s += bias.to(tl.float32) * LOG2E
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        alpha = tl.exp2(m_i - m_new)
++        p = tl.exp2(s - m_new[:, None])
++        l_i = l_i * alpha + tl.sum(p, 1)
++        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
++        m_i = m_new
++
++    for n in range(int_hi, n_hi):
++        keys = n * BLOCK_N + offs_n
++        key_valid = keys < seqlen_k
++        page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
++        kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
++        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
++        s = tl.dot(q, tl.trans(k)) * qk_scale
++        dist = pos[:, None] - keys[None, :]
++        visible = (dist >= 0) & key_valid[None, :]
++        in_extent = visible & (dist < E) & row_valid[:, None]
++        bias = tl.load(rel_row[:, None] + keys[None, :], mask=in_extent, other=0.0)
++        s = tl.where(visible, s + bias.to(tl.float32) * LOG2E, float("-inf"))
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
++        alpha = tl.exp2(m_i - m_safe)
++        p = tl.exp2(s - m_safe[:, None])
++        l_i = l_i * alpha + tl.sum(p, 1)
++        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
++        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
++        m_i = m_new
++
++    empty = l_i == 0.0
++    o = acc / tl.where(empty, 1.0, l_i)[:, None]
++    lse2 = tl.where(empty, float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
++    tl.store(
++        Out + token[:, None] * stride_out_t + head[:, None] * stride_out_h + offs_d[None, :],
++        o,
++        mask=row_valid[:, None],
++    )
++    tl.store(
++        Lse + head * stride_lse_h + token * stride_lse_t,
++        lse2 * 0.6931471805599453,
++        mask=row_valid,
++    )
++
++
++@triton.jit
++def _rel_attention_near_causal_kernel(
++    Q,
++    K,
++    V,
++    Rel,
++    BlockTable,
++    SeqLens,
++    CuSeqlensQ,
++    FarRowIdx,
++    FarOut,
++    FarLse,
++    Out,
++    Lse,
++    softmax_scale,
++    stride_q_t,
++    stride_q_h,
++    stride_kv_blk,
++    stride_kv_slot,
++    stride_kv_h,
++    stride_rel_t,
++    stride_bt,
++    stride_fo_t,
++    stride_fo_h,
++    stride_fl_t,
++    stride_fl_h,
++    stride_out_t,
++    stride_out_h,
++    stride_lse_h,
++    stride_lse_t,
++    H: tl.constexpr,
++    G: tl.constexpr,
++    D: tl.constexpr,
++    E: tl.constexpr,
++    PAGE: tl.constexpr,
++    BLOCK_M: tl.constexpr,
++    BLOCK_N: tl.constexpr,
++):
++    """Exact NEAR (0 <= dist < E) Triton kernel initialized directly from FlashInfer causal=True FAR (dist >= E).
++    Only scans the E=1024 window (32 blocks of BN=32, num_stages=5) regardless of chunk length!"""
++    TOKENS: tl.constexpr = BLOCK_M // G
++    E_PAD: tl.constexpr = E + 256
++    LOG2E: tl.constexpr = 1.4426950408889634
++    m_tile = tl.program_id(0)
++    kv_head = tl.program_id(1)
++    req = tl.program_id(2)
++    q_start = tl.load(CuSeqlensQ + req)
++    q_len = tl.load(CuSeqlensQ + req + 1) - q_start
++    first_tok = m_tile * TOKENS
++    if first_tok >= q_len:
++        return
++    seqlen_k = tl.load(SeqLens + req)
++    past = seqlen_k - q_len
++
++    rows = tl.arange(0, BLOCK_M)
++    tok = first_tok + rows // G
++    row_valid = (rows < TOKENS * G) & (tok < q_len)
++    head = kv_head * G + rows % G
++    token = (q_start + tok).to(tl.int64)
++    pos = past + tok
++    pos_lo = past + first_tok
++    pos_hi = past + tl.minimum(first_tok + TOKENS, q_len) - 1
++
++    offs_d = tl.arange(0, D)
++    offs_n = tl.arange(0, BLOCK_N)
++    q = tl.load(
++        Q + token[:, None] * stride_q_t + head[:, None] * stride_q_h + offs_d[None, :],
++        mask=row_valid[:, None],
++        other=0.0,
++    )
++    tile_end = tl.minimum((tok // _SHEAR_TILE + 1) * _SHEAR_TILE, q_len)
++    rel_base = (past + tile_end + 127) // 128 * 128 - E_PAD
++    rel_row = Rel + token * stride_rel_t + head * E_PAD - rel_base
++
++    qk_scale = softmax_scale * LOG2E
++    far_row = tl.load(FarRowIdx + token, mask=row_valid, other=-1).to(tl.int64)
++    has_far = row_valid & (far_row >= 0)
++    safe_far = tl.maximum(far_row, 0)
++    flse = tl.load(
++        FarLse + safe_far * stride_fl_t + head * stride_fl_h,
++        mask=has_far,
++        other=float("-inf"),
++    ).to(tl.float32)
++    fout = tl.load(
++        FarOut + safe_far[:, None] * stride_fo_t + head[:, None] * stride_fo_h + offs_d[None, :],
++        mask=has_far[:, None],
++        other=0.0,
++    ).to(tl.float32)
++    m_i = flse
++    l_i = tl.where(has_far & (flse > float("-inf")), 1.0, 0.0)
++    acc = fout
++
++    n_lo = tl.maximum(pos_lo - (E - 1), 0) // BLOCK_N
++    n_hi = (tl.minimum(pos_hi + 1, seqlen_k) + BLOCK_N - 1) // BLOCK_N
++    int_lo = tl.maximum(n_lo, tl.cdiv(tl.maximum(pos_hi - (E - 1), 0), BLOCK_N))
++    int_hi = tl.minimum(n_hi, (pos_lo + 1) // BLOCK_N)
++    int_hi = tl.maximum(int_hi, int_lo)
++    int_lo = tl.minimum(int_lo, n_hi)
++
++    block_table = BlockTable + req.to(tl.int64) * stride_bt
++    kv_off = kv_head * stride_kv_h
++
++    for n in range(n_lo, int_lo):
++        keys = n * BLOCK_N + offs_n
++        key_valid = keys < seqlen_k
++        page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
++        kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
++        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
++        s = tl.dot(q, tl.trans(k)) * qk_scale
++        dist = pos[:, None] - keys[None, :]
++        visible = (dist >= 0) & (dist < E) & key_valid[None, :]
++        bias = tl.load(rel_row[:, None] + keys[None, :], mask=visible & row_valid[:, None], other=0.0)
++        s = tl.where(visible, s + bias.to(tl.float32) * LOG2E, float("-inf"))
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
++        alpha = tl.exp2(m_i - m_safe)
++        p = tl.exp2(s - m_safe[:, None])
++        l_i = l_i * alpha + tl.sum(p, 1)
++        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
++        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
++        m_i = m_new
++
++    for n in range(int_lo, int_hi):
++        keys = n * BLOCK_N + offs_n
++        page = tl.load(block_table + keys // PAGE)
++        kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
++        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++        s = tl.dot(q, tl.trans(k)) * qk_scale
++        bias = tl.load(rel_row[:, None] + keys[None, :], mask=row_valid[:, None], other=0.0)
++        s += bias.to(tl.float32) * LOG2E
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        alpha = tl.exp2(m_i - m_new)
++        p = tl.exp2(s - m_new[:, None])
++        l_i = l_i * alpha + tl.sum(p, 1)
++        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :]).to(q.dtype)
++        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
++        m_i = m_new
++
++    for n in range(int_hi, n_hi):
++        keys = n * BLOCK_N + offs_n
++        key_valid = keys < seqlen_k
++        page = tl.load(block_table + keys // PAGE, mask=key_valid, other=0)
++        kv_ptrs = page.to(tl.int64) * stride_kv_blk + (keys % PAGE) * stride_kv_slot + kv_off
++        k = tl.load(K + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
++        s = tl.dot(q, tl.trans(k)) * qk_scale
++        dist = pos[:, None] - keys[None, :]
++        visible = (dist >= 0) & (dist < E) & key_valid[None, :]
++        bias = tl.load(rel_row[:, None] + keys[None, :], mask=visible & row_valid[:, None], other=0.0)
++        s = tl.where(visible, s + bias.to(tl.float32) * LOG2E, float("-inf"))
++        m_new = tl.maximum(m_i, tl.max(s, 1))
++        m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
++        alpha = tl.exp2(m_i - m_safe)
++        p = tl.exp2(s - m_safe[:, None])
++        l_i = l_i * alpha + tl.sum(p, 1)
++        v = tl.load(V + kv_ptrs[:, None] + offs_d[None, :], mask=key_valid[:, None], other=0.0).to(q.dtype)
++        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
++        m_i = m_new
++
++    empty = l_i == 0.0
++    o = acc / tl.where(empty, 1.0, l_i)[:, None]
++    lse2 = tl.where(empty, float("-inf"), m_i + tl.log2(tl.where(empty, 1.0, l_i)))
++    tl.store(
++        Out + token[:, None] * stride_out_t + head[:, None] * stride_out_h + offs_d[None, :],
++        o,
++        mask=row_valid[:, None],
++    )
++    tl.store(
++        Lse + head * stride_lse_h + token * stride_lse_t,
++        lse2 * 0.6931471805599453,
++        mask=row_valid,
++    )
++
++
++def rel_attention_full_hybrid(
++    q: torch.Tensor,
++    kv_cache: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    out: torch.Tensor,
++    lse: torch.Tensor | None,
++    rel_logits: torch.Tensor,
++    gate: torch.Tensor | None = None,
++    sinks: torch.Tensor | None = None,
++    *,
++    md: Any,
++    num_decodes: int,
++    block_table: torch.Tensor,
++    cache_seqlens: torch.Tensor,
++    cu_seqlens_q: torch.Tensor,
++    q_lens_cpu: np.ndarray,
++    seq_lens_cpu: np.ndarray,
++    max_query_len: int,
++    softmax_scale: float,
++) -> bool:
++    """sm_80 full-layer prefill hybrid: FlashInfer HND FAR + 4-interval interior-split Triton NEAR
++    with optional fused gate_sink epilogue (returns True if handled)."""
++    if (
++        not current_platform.is_device_capability_family(80)
++        or os.environ.get("INKLING_SM80_NO_FI_FAR") == "1"
++        or q.dtype != torch.bfloat16
++        or kv_cache.dtype != torch.bfloat16
++        or kv_cache.ndim != 4
++    ):
++        return False
++    num_tokens, num_heads, head_dim = q.shape
++    if num_tokens == 0:
++        return False
++    page, num_kv_heads = key_cache.shape[1:3]
++    if kv_cache.shape[1] != num_kv_heads or kv_cache.shape[2] != page or kv_cache.shape[3] != 2 * head_dim:
++        return False
++    num_reqs = cache_seqlens.shape[0]
++    if len(q_lens_cpu) != num_reqs or len(seq_lens_cpu) != num_reqs or int(q_lens_cpu.sum()) != num_tokens:
++        return False
++    gated = gate is not None and sinks is not None
++    group = num_heads // num_kv_heads
++    tokens_per_tile = 128 // group
++    extent = rel_logits.shape[2] - 256
++    block_n = 32
++    align_k = max(page, block_n)
++
++    plan_cache = getattr(md, "_sm80_fi_plan_cache", None)
++    if plan_cache is None:
++        plan_cache = {}
++        md._sm80_fi_plan_cache = plan_cache
++    plan_key = (num_decodes, num_tokens, num_heads, num_kv_heads, head_dim, page, extent)
++    cached = plan_cache.get(plan_key)
++
++    if cached is None:
++        # for past < 65536, FlashInfer causal=True computes the exact FAR region (j <= pos - E)
++        # in one pass with zero sub-chunking, leaving only E=1024 NEAR keys for Triton (num_stages=5)
++        # For past >= 65536, non-causal FlashInfer avoids causal masking in the long FAR loop.
++        use_causal = (
++            os.environ.get("INKLING_SM80_NO_CAUSAL_FI") != "1"
++            and all((int(seq_lens_cpu[r]) - int(q_lens_cpu[r])) < 65536 for r in range(num_reqs))
++        )
++        if use_causal:
++            qo_indptr = [0]
++            kv_indptr = [0]
++            far_reqs_c: list[tuple[int, int]] = []
++            kv_last_page_len = []
++            far_row_idx = np.full(num_tokens, -1, dtype=np.int32)
++            q_ranges: list[tuple[int, int]] = []
++            max_far_pages = 0
++            tok_off = 0
++            far_tok_off = 0
++            for r in range(num_reqs):
++                ql = int(q_lens_cpu[r])
++                sk = int(seq_lens_cpu[r])
++                past = sk - ql
++                if sk > extent:
++                    skip = max(0, extent - past)
++                    far_q_len = ql - skip
++                    far_kv_len = sk - extent
++                    if far_q_len > 0 and far_kv_len > 0:
++                        far_row_idx[tok_off + skip : tok_off + ql] = np.arange(
++                            far_tok_off, far_tok_off + far_q_len, dtype=np.int32
++                        )
++                        q_ranges.append((tok_off + skip, tok_off + ql))
++                        far_tok_off += far_q_len
++                        qo_indptr.append(far_tok_off)
++                        n_pages = (far_kv_len + page - 1) // page
++                        if n_pages > max_far_pages:
++                            max_far_pages = n_pages
++                        far_reqs_c.append((r, n_pages))
++                        kv_indptr.append(kv_indptr[-1] + n_pages)
++                        kv_last_page_len.append(far_kv_len - (n_pages - 1) * page)
++                tok_off += ql
++            if max_far_pages == 0:
++                plan_cache[plan_key] = (False, False, None, None, None)
++                return False
++            bt_cpu = block_table[:, :max_far_pages].to("cpu", non_blocking=False).numpy()
++            kv_indices_np = np.concatenate(
++                [bt_cpu[r, :np_r] for r, np_r in far_reqs_c]
++            ).astype(np.int32, copy=False)
++            fi_wrapper = _get_sm80_fi_wrapper(q.device)
++            fi_wrapper.plan(
++                torch.tensor(qo_indptr, dtype=torch.int32),
++                torch.tensor(kv_indptr, dtype=torch.int32),
++                torch.from_numpy(kv_indices_np),
++                torch.tensor(kv_last_page_len, dtype=torch.int32),
++                num_heads,
++                num_kv_heads,
++                head_dim,
++                page,
++                causal=True,
++                sm_scale=softmax_scale,
++                q_data_type=torch.bfloat16,
++                kv_data_type=torch.bfloat16,
++            )
++            far_row_gpu = torch.from_numpy(far_row_idx).to(q.device, non_blocking=True)
++            cached = (True, True, fi_wrapper, far_row_gpu, q_ranges)
++            plan_cache[plan_key] = cached
++        else:
++            chunk_q = 24 * tokens_per_tile
++            qo_indptr = [0]
++            kv_indptr = [0]
++            far_reqs: list[tuple[int, int]] = []
++            kv_last_page_len = []
++            far_lens_tok = np.zeros(num_tokens, dtype=np.int32)
++            max_far_pages = 0
++            tok_off = 0
++            for r in range(num_reqs):
++                ql = int(q_lens_cpu[r])
++                sk = int(seq_lens_cpu[r])
++                past = sk - ql
++                sub_step = chunk_q if (ql > chunk_q and past < 65536) else ql
++                pos_in_req = 0
++                while pos_in_req < ql:
++                    sub_len = min(sub_step, ql - pos_in_req)
++                    sub_past = past + pos_in_req
++                    far_len = max(0, ((sub_past - extent + 1) // align_k) * align_k)
++                    far_lens_tok[tok_off : tok_off + sub_len] = far_len
++                    qo_indptr.append(qo_indptr[-1] + sub_len)
++                    if far_len > 0:
++                        n_pages = far_len // page
++                        if n_pages > max_far_pages:
++                            max_far_pages = n_pages
++                        far_reqs.append((r, n_pages))
++                        kv_indptr.append(kv_indptr[-1] + n_pages)
++                        kv_last_page_len.append(page)
++                    else:
++                        kv_indptr.append(kv_indptr[-1])
++                        kv_last_page_len.append(0)
++                    tok_off += sub_len
++                    pos_in_req += sub_len
++
++            if max_far_pages == 0:
++                plan_cache[plan_key] = (False, False, None, None, None)
++                return False
++
++            bt_cpu = block_table[:, :max_far_pages].to("cpu", non_blocking=False).numpy()
++            kv_indices_np = np.concatenate([bt_cpu[r, :np_r] for r, np_r in far_reqs]).astype(
++                np.int32, copy=False
++            )
++            fi_wrapper = _get_sm80_fi_wrapper(q.device)
++            fi_wrapper.plan(
++                torch.tensor(qo_indptr, dtype=torch.int32),
++                torch.tensor(kv_indptr, dtype=torch.int32),
++                torch.from_numpy(kv_indices_np),
++                torch.tensor(kv_last_page_len, dtype=torch.int32),
++                num_heads,
++                num_kv_heads,
++                head_dim,
++                page,
++                causal=False,
++                sm_scale=softmax_scale,
++                q_data_type=torch.bfloat16,
++                kv_data_type=torch.bfloat16,
++            )
++            far_lens_gpu = torch.from_numpy(far_lens_tok).to(q.device, non_blocking=True)
++            cached = (True, False, fi_wrapper, far_lens_gpu, None)
++            plan_cache[plan_key] = cached
++
++    any_far, is_causal, fi_wrapper, far_meta_gpu, q_ranges = cached
++    if not any_far:
++        return False
++
++    q_in = q if q.is_contiguous() else q.contiguous()
++    kc_fi, vc_fi = kv_cache.split(head_dim, dim=-1)
++    assert lse is not None
++    grid = (triton.cdiv(max_query_len, tokens_per_tile), num_kv_heads, num_reqs)
++
++    if is_causal:
++        if len(q_ranges) == 1:
++            lo, hi = q_ranges[0]
++            q_far = q_in[lo:hi]
++        else:
++            q_far = torch.cat([q_in[lo:hi] for lo, hi in q_ranges], dim=0)
++        far_out, far_lse = fi_wrapper.run(q_far, (kc_fi, vc_fi), return_lse=True)
++        _rel_attention_near_causal_kernel[grid](
++            q_in,
++            key_cache,
++            value_cache,
++            rel_logits,
++            block_table,
++            cache_seqlens,
++            cu_seqlens_q,
++            far_meta_gpu,
++            far_out,
++            far_lse,
++            out,
++            lse,
++            softmax_scale,
++            q_in.stride(0),
++            q_in.stride(1),
++            key_cache.stride(0),
++            key_cache.stride(1),
++            key_cache.stride(2),
++            rel_logits.stride(0),
++            block_table.stride(0),
++            far_out.stride(0),
++            far_out.stride(1),
++            far_lse.stride(0),
++            far_lse.stride(1),
++            out.stride(0),
++            out.stride(1),
++            lse.stride(0),
++            lse.stride(1),
++            H=num_heads,
++            G=group,
++            D=head_dim,
++            E=extent,
++            PAGE=page,
++            BLOCK_M=128,
++            BLOCK_N=block_n,
++            num_warps=4,
++            num_stages=5,
++        )
++        return True
++
++    far_out, far_lse = fi_wrapper.run(q_in, (kc_fi, vc_fi), return_lse=True)
++    _rel_attention_near_kernel[grid](
++        q_in,
++        key_cache,
++        value_cache,
++        rel_logits,
++        block_table,
++        cache_seqlens,
++        cu_seqlens_q,
++        far_meta_gpu,
++        far_out,
++        far_lse,
++        out,
++        lse,
++        softmax_scale,
++        q_in.stride(0),
++        q_in.stride(1),
++        key_cache.stride(0),
++        key_cache.stride(1),
++        key_cache.stride(2),
++        rel_logits.stride(0),
++        block_table.stride(0),
++        far_out.stride(0),
++        far_out.stride(1),
++        far_lse.stride(0),
++        far_lse.stride(1),
++        out.stride(0),
++        out.stride(1),
++        lse.stride(0),
++        lse.stride(1),
++        H=num_heads,
++        G=group,
++        D=head_dim,
++        E=extent,
++        PAGE=page,
++        BLOCK_M=128,
++        BLOCK_N=block_n,
++        num_warps=4,
++        num_stages=5,
++    )
++    return True
++
++
+ def _block_m(max_query_len: int, group: int) -> int:
+     rows = max_query_len * group
+     return 16 if rows <= 16 else 32 if rows <= 32 else 64 if rows <= 64 else 128
+@@ -255,17 +1117,6 @@
+     num_splits: int,
+     mode: int,
+ ) -> None:
+-    """Launch `_rel_attention_kernel` over the requests of `cu_seqlens_q`.
+-
+-    `rel_logits` (sheared, `(T + 128, H, extent + 256)`) is None for the
+-    DSpark draft: plain block attention with all queries of a request at
+-    its last position. `window` (keys up to a query's position, inclusive) is
+-    0 for full layers. `mode` selects the output: `MODE_OUT_LSE` writes the
+-    fp32 `out` `(T, H, D)` and natural-log `lse` `(H, T)`; `MODE_GATED`
+-    the bf16 `(T, H * D)` `out` (gated by `gate` and `sinks` unless
+-    drafting; a single split); `MODE_PARTIAL` the fp32 `out`
+-    `(S, T, H, D)` and log2 `lse` `(S, T, H)` partials.
+-    """
+     num_tokens, num_heads, head_dim = q.shape
+     page, num_kv_heads = key_cache.shape[1:3]
+     group = num_heads // num_kv_heads
+@@ -281,15 +1132,64 @@
+     if mode == MODE_GATED and not draft:
+         assert gate is not None and sinks is not None
+         assert gate.stride(1) == sinks.stride(1) == 1
+-    # Unused pointers keep the launches typed alike.
++
++    block_m = _block_m(max_query_len, group)
++    tokens_per_tile = block_m // group
++    num_reqs = cache_seqlens.shape[0]
++
++    # sm_80 local-window prefill interior-block fast path (zero-spill OUT_LSE).
++    if (
++        mode == MODE_OUT_LSE
++        and window > 0
++        and not draft
++        and num_splits == 1
++        and block_m >= 128
++        and key_cache.element_size() == 2
++        and current_platform.is_device_capability_family(80)
++        and lse is not None
++    ):
++        grid_loc = (triton.cdiv(max_query_len, tokens_per_tile), num_kv_heads, num_reqs)
++        _loc_bn64 = num_tokens <= 4096
++        _rel_attention_local_prefill_kernel[grid_loc](
++            q,
++            key_cache,
++            value_cache,
++            rel_logits,
++            block_table,
++            cache_seqlens,
++            cu_seqlens_q,
++            out,
++            lse,
++            softmax_scale,
++            q.stride(0),
++            q.stride(1),
++            key_cache.stride(0),
++            key_cache.stride(1),
++            key_cache.stride(2),
++            rel_logits.stride(0),
++            block_table.stride(0),
++            out.stride(0),
++            out.stride(1),
++            lse.stride(0),
++            lse.stride(1),
++            H=num_heads,
++            G=group,
++            D=head_dim,
++            E=extent,
++            PAGE=page,
++            WINDOW=window,
++            BLOCK_M=block_m,
++            BLOCK_N=64 if _loc_bn64 else 32,
++            num_warps=8 if _loc_bn64 else 4,
++            num_stages=3 if _loc_bn64 else 5,
++        )
++        return
++
+     rel = q if rel_logits is None else rel_logits
+     gate = q if gate is None else gate
+     sinks = q if sinks is None else sinks
+     if lse is None:
+         lse = out
+-    block_m = _block_m(max_query_len, group)
+-    tokens_per_tile = block_m // group
+-    num_reqs = cache_seqlens.shape[0]
+     grid = (
+         triton.cdiv(max_query_len, tokens_per_tile),
+         num_kv_heads * num_splits,
+@@ -303,6 +1203,12 @@
+     else:
+         assert out.is_contiguous() and lse.is_contiguous()
+         out_strides = (0, 0, 0, 0)
++    _full_dec_128 = (
++        (not draft)
++        and (window == 0)
++        and (block_m <= 32)
++        and current_platform.is_device_capability_family(80)
++    )
+     _rel_attention_kernel[grid](
+         q,
+         key_cache,
+@@ -337,7 +1243,7 @@
          DRAFT=draft,
          MODE=mode,
          BLOCK_M=block_m,
 -        BLOCK_N=64 if block_m >= 128 else 128 if block_m <= 32 else 64,
 -        num_warps=8 if block_m >= 128 else 4,
 -        num_stages=2,
-+        # sm_80 (Ampere): for the 128-row prefill tiles, full layers take 32-key blocks with 4 warps
-+        # (~9% faster at 120k-250k of context, with the far-block loop above) and window layers 64-key blocks,
-+        # 8 warps, 3 stages (2.15-2.40 ms an 8k chunk against 2.45-2.88); the other tiles as before.
-+        BLOCK_N=(64 if window else 32) if block_m >= 128 else 128 if block_m <= 32 else 64,
-+        num_warps=(8 if window else 4) if block_m >= 128 else 4,
-+        num_stages=3 if (window and block_m >= 128) else 2,
++        BLOCK_N=(64 if window else 32) if block_m >= 128 else (128 if ((window or _full_dec_128) and block_m <= 32) else 64),
++        num_warps=(8 if window else 4) if block_m >= 128 else (8 if _full_dec_128 else 4),
++        num_stages=(3 if window else 4) if block_m >= 128 else 2,
      )
 --- a/vllm/models/inkling2/nvidia/ops/conv_mix.py
 +++ b/vllm/models/inkling2/nvidia/ops/conv_mix.py
-@@ -89,7 +89,10 @@
+@@ -3,6 +3,8 @@
+ """Hidden-stream short conv fused with the AttnRes mix + RMSNorm of the next
+ sublayer, for large batches of an already reduced input (CUDA)."""
+ 
++import os
++
+ import torch
+ 
+ from vllm.platforms import current_platform
+@@ -11,6 +13,13 @@
+ from .sconv import short_conv
+ from .seq_parallel import SeqParallel
+ 
++try:
++    from inkling_sm80_cuda import HAS_CUDA_EXT as _SM80_HAS_CUDA
++    from inkling_sm80_cuda import conv_mix_cuda as _sm80_conv_mix_cuda
++except Exception:
++    _SM80_HAS_CUDA = False
++    _sm80_conv_mix_cuda = None
++
+ 
+ def conv_mix(
+     x: torch.Tensor,
+@@ -89,7 +98,54 @@
      )
      if sp is None:
          assert halo == 0 and positions.shape[0] == num_tokens and x.dim() == 2
@@ -171,37 +2071,137 @@
 +        if current_platform.is_device_capability_family(
 +            120
 +        ) or not current_platform.has_device_capability(90):
-+            # sm_80 (Ampere) too: the image's inkling2_conv_mix op is built for Hopper / SM10x only.
++            # sm_80: fused CUDA conv_mix (100% bit-exact):
++            # - Decode (T <= 256): 288t for n_stack<=3, 576t zero-spill for n_stack=4..7 (1.33x faster)
++            # - Prefill (T > 256, both Q == 1 AND Q == 3): 1-barrier intra-fast-path 288t CUDA conv_mix (1.33-1.73x faster)
++            if (
++                _SM80_HAS_CUDA
++                and current_platform.is_device_capability_family(80)
++                and os.environ.get("INKLING_SM80_NO_CUDA_CONVMIX") != "1"
++                and d == 2304
++                and stream_width % 8 == 0
++                and stream_offset % 8 == 0
++                and stack.shape[0] <= 7
++                and queries.shape[0] in (1, 3)
++                and conv_weight.dtype == torch.bfloat16
++                and cache.dtype == torch.bfloat16
++                and stack.dtype == torch.bfloat16
++                and conv_out.dtype == torch.bfloat16
++                and (norm_weight is None or norm_weight.dtype == torch.bfloat16)
++                and (residual is None or residual.dtype == torch.bfloat16)
++                and (addend is None or addend.dtype == torch.bfloat16)
++                and (last is None or last.dtype == torch.bfloat16)
++                and block_table.dtype == torch.int32
++                and seq_idx.dtype == torch.int32
++                and query_start.dtype == torch.int32
++            ):
++                return _sm80_conv_mix_cuda(
++                    x,
++                    conv_weight,
++                    cache,
++                    positions,
++                    block_table,
++                    seq_idx,
++                    slot_mapping,
++                    query_start,
++                    stream_offset,
++                    stream_width,
++                    conv_out,
++                    residual,
++                    addend,
++                    stack,
++                    last,
++                    queries,
++                    norm_weight,
++                    norm_eps,
++                    eps,
++                )
              # Native conv/mix kernels require Hopper or SM10x. Keep the
              # loop executor's cache writes and residual rounding on SM12x.
              short_conv(
 --- a/vllm/models/inkling2/nvidia/ops/gemv.py
 +++ b/vllm/models/inkling2/nvidia/ops/gemv.py
-@@ -54,6 +54,163 @@
+@@ -1,13 +1,29 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""Low-M BF16 tensor-core projections for SM120/SM121."""
++"""Low-M BF16 tensor-core projections and fused sm_80 controller/vocab kernels."""
++
++import os
+ 
+ import torch
+ 
+ from vllm.platforms import current_platform
+-from vllm.triton_utils import tl, triton
++from vllm.triton_utils import tl, tldevice, triton
++
++try:
++    from inkling_sm80_cuda import HAS_CUDA_EXT as _SM80_HAS_CUDA
++    from inkling_sm80_cuda import (
++        fused_pair_norm_ctrl_down_cuda as _sm80_fused_pair_norm_ctrl_down,
++        pair_rms_norm_rank2_cuda as _sm80_pair_rms_norm_rank2,
++        rms_norm_f32_to_bf16_cuda as _sm80_rms_norm_f32_to_bf16,
++    )
++except Exception:
++    _SM80_HAS_CUDA = False
++    _sm80_fused_pair_norm_ctrl_down = None
++    _sm80_pair_rms_norm_rank2 = None
++    _sm80_rms_norm_f32_to_bf16 = None
+ 
+ MAX_M = 16
++SM80_MAX_M = 64
+ _BN, _BK = 32, 256
+ 
+ 
+@@ -54,6 +70,1217 @@
      )
  
  
-+# sm_80 (Ampere): the same kernel beats cuBLAS at 5-16 rows on the GA100 too (cuBLAS picks split-K tiles
-+# plus a reduce kernel there). Tiles measured per shape with the Inkling2 weights: (BN, BK, warps, stages).
-+# Measured with cold weights (cycled past the 40 MB L2, as in the model).
-+def _sm80_tiles(n: int, k: int) -> tuple[int, int, int, int]:
-+    if n >= 65536:  # vocab heads; the draft's Markov fold has K=256
-+        return (64, 64, 2, 3) if k <= 512 else (64, 256, 2, 4)
++def _sm80_tiles(n: int, k: int, m: int = 16) -> tuple[int, int, int, int]:
++    if n >= 65536:
++        if m > 16:
++            return (128, 128, 4, 3) if m <= 32 else (128, 128, 4, 4)
++        return (64, 64, 2, 3) if k <= 512 else (64, 256, 4, 4)
 +    if n <= 1024:
 +        return 16, 256, 2, 3
 +    if n >= 16384:
++        if m > 16:
++            return (128, 128, 4, 3) if m <= 32 else (128, 64, 4, 4)
 +        return 64, 128, 8, 2
 +    if n >= 8192:
-+        return 64, 128, 4, 3
++        return (128, 128, 4, 4) if m > 16 else (128, 128, 4, 3)
++    if k >= 8192 and m > 16:
++        return (64, 256, 4, 4) if m <= 32 else (32, 256, 4, 4)
 +    if k >= 3072:
 +        return 32, 256, 4, 4
++    if n == 2560 and m <= 32:
++        return 64, 256, 4, 4
 +    return 32, 128, 4, 4
 +
 +
 +@triton.jit
-+def _seg3_gemv_kernel(X0, X1, X2, W, Y, M, K, SX0, SX1, SX2, SW, SY, N0, N1, N2, NB0, NB1,
-+                      BN: tl.constexpr, BK: tl.constexpr, MP: tl.constexpr):
-+    # Y[:, seg] = X_seg @ W[seg].T for three consecutive column segments (= weight rows) of widths N0, N1, N2.
++def _seg3_gemv_kernel(
++    X0,
++    X1,
++    X2,
++    W,
++    Y,
++    M,
++    K,
++    SX0,
++    SX1,
++    SX2,
++    SW,
++    SY,
++    N0,
++    N1,
++    N2,
++    NB0,
++    NB1,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++    MP: tl.constexpr,
++):
 +    pid = tl.program_id(0)
 +    if pid < NB0:
 +        X = X0
@@ -227,43 +2227,1018 @@
 +    acc = tl.zeros((MP, BN), tl.float32)
 +    for k0 in range(0, K, BK):
 +        ks = k0 + tl.arange(0, BK)
-+        w = tl.load(W + cols[None, :].to(tl.int64) * SW + ks[:, None], cmask[None, :] & (ks[:, None] < K), other=0)
-+        x = tl.load(X + rows[:, None] * SX + ks[None, :], (rows[:, None] < M) & (ks[None, :] < K), other=0)
++        w = tl.load(
++            W + cols[None, :].to(tl.int64) * SW + ks[:, None],
++            cmask[None, :] & (ks[:, None] < K),
++            other=0,
++        )
++        x = tl.load(
++            X + rows[:, None] * SX + ks[None, :],
++            (rows[:, None] < M) & (ks[None, :] < K),
++            other=0,
++        )
 +        acc += tl.dot(x, w)
-+    tl.store(Y + rows[:, None] * SY + cols[None, :], acc.to(Y.dtype.element_ty), (rows[:, None] < M) & cmask[None, :])
++    tl.store(
++        Y + rows[:, None] * SY + cols[None, :],
++        acc.to(Y.dtype.element_ty),
++        (rows[:, None] < M) & cmask[None, :],
++    )
 +
 +
-+SEG3_TILES = (64, 128, 4, 3)
++def _sm80_seg3_tiles(m: int) -> tuple[int, int, int, int]:
++    # M <= 16: BN=64 (29.4us); 16 < M <= 64 (8u M=40): BN=128 (34.6us vs 39.3us).
++    if m > 16:
++        return 128, 128, 4, 3
++    return 64, 128, 4, 3
 +
 +
-+def sm80_seg3_gemv(xs: tuple[torch.Tensor, torch.Tensor, torch.Tensor], weight: torch.Tensor,
-+                   widths: tuple[int, int, int]) -> torch.Tensor | None:
-+    """sm_80 (Ampere): one launch for `cat([xs[i] @ weight[seg_i].T])` over three consecutive weight-row segments
-+    of `widths`, each with its own input (a full layer's or loop pass's q-side / k / v projections, three launches
-+    otherwise). Returns bf16 (M, sum(widths)), or None where it does not apply."""
++def sm80_seg3_gemv(
++    xs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
++    weight: torch.Tensor,
++    widths: tuple[int, int, int],
++) -> torch.Tensor | None:
 +    if not current_platform.is_device_capability_family(80) or weight.dtype != torch.bfloat16:
 +        return None
 +    m, k = xs[0].shape[0], weight.shape[1]
 +    for x in xs:
-+        if (x.ndim != 2 or x.dtype != torch.bfloat16 or x.shape != (m, k) or x.stride(-1) != 1
-+                or x.device != weight.device):
++        if (
++            x.ndim != 2
++            or x.dtype != torch.bfloat16
++            or x.shape != (m, k)
++            or x.stride(-1) != 1
++            or x.device != weight.device
++        ):
 +            return None
-+    if not 0 < m <= MAX_M or weight.stride(-1) != 1 or weight.shape[0] < sum(widths):
++    if not 0 < m <= SM80_MAX_M or weight.stride(-1) != 1 or weight.shape[0] < sum(widths):
 +        return None
 +    n = sum(widths)
 +    out = torch.empty((m, n), device=weight.device, dtype=torch.bfloat16)
-+    bn, bk, warps, stages = SEG3_TILES
++    bn, bk, warps, stages = _sm80_seg3_tiles(m)
++    mp = 16 if m <= 16 else (32 if m <= 32 else 64)
 +    nb = [triton.cdiv(w, bn) for w in widths]
-+    _seg3_gemv_kernel[(sum(nb),)](xs[0], xs[1], xs[2], weight, out, m, k, xs[0].stride(0), xs[1].stride(0),
-+        xs[2].stride(0), weight.stride(0), out.stride(0), *widths, nb[0], nb[1], BN=bn, BK=bk, MP=16,
-+        num_warps=warps, num_stages=stages)
++    _seg3_gemv_kernel[(sum(nb),)](
++        xs[0],
++        xs[1],
++        xs[2],
++        weight,
++        out,
++        m,
++        k,
++        xs[0].stride(0),
++        xs[1].stride(0),
++        xs[2].stride(0),
++        weight.stride(0),
++        out.stride(0),
++        *widths,
++        nb[0],
++        nb[1],
++        BN=bn,
++        BK=bk,
++        MP=mp,
++        num_warps=warps,
++        num_stages=stages,
++    )
 +    return out
 +
 +
 +@triton.jit
-+def _ctrl_down_kernel(X, W, P, M, N, K, SXS, SXM, SWS, SWN, K_PER: tl.constexpr,
-+                      BN: tl.constexpr, BK: tl.constexpr, MP: tl.constexpr):
-+    # fp32 partial [split, s, m, n] of X[s] @ W[s].T over one K slice.
++def _seg3_dyn_gemv_kernel(
++    X0,
++    X1,
++    X2,
++    W,
++    WK_dyn,
++    WV_dyn,
++    Y,
++    YK_dyn,
++    YV_dyn,
++    M,
++    K,
++    SX0,
++    SX1,
++    SX2,
++    SW,
++    SWK,
++    SWV,
++    SY,
++    N0,
++    N1,
++    N2,
++    N_DYN,
++    NB0,
++    NB1,
++    NB2,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++    MP: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    if pid < NB0:
++        X = X0
++        SX = SX0
++        WP = W
++        SW_U = SW
++        YP = Y
++        SY_U = SY
++        lo = 0
++        hi = N0
++        local = pid
++    elif pid < NB0 + NB1:
++        X = X1
++        SX = SX1
++        WP = W
++        SW_U = SW
++        YP = Y
++        SY_U = SY
++        lo = N0
++        hi = N0 + N1
++        local = pid - NB0
++    elif pid < NB0 + NB1 + NB2:
++        X = X2
++        SX = SX2
++        WP = W
++        SW_U = SW
++        YP = Y
++        SY_U = SY
++        lo = N0 + N1
++        hi = N0 + N1 + N2
++        local = pid - NB0 - NB1
++    elif pid == NB0 + NB1 + NB2:
++        X = X1
++        SX = SX1
++        WP = WK_dyn
++        SW_U = SWK
++        YP = YK_dyn
++        SY_U = N_DYN
++        lo = 0
++        hi = N_DYN
++        local = 0
++    else:
++        X = X2
++        SX = SX2
++        WP = WV_dyn
++        SW_U = SWV
++        YP = YV_dyn
++        SY_U = N_DYN
++        lo = 0
++        hi = N_DYN
++        local = 0
++    cols = lo + local * BN + tl.arange(0, BN)
++    cmask = cols < hi
++    rows = tl.arange(0, MP)
++    acc = tl.zeros((MP, BN), tl.float32)
++    for k0 in range(0, K, BK):
++        ks = k0 + tl.arange(0, BK)
++        w = tl.load(
++            WP + cols[None, :].to(tl.int64) * SW_U + ks[:, None],
++            cmask[None, :] & (ks[:, None] < K),
++            other=0,
++        )
++        x = tl.load(
++            X + rows[:, None] * SX + ks[None, :],
++            (rows[:, None] < M) & (ks[None, :] < K),
++            other=0,
++        )
++        acc += tl.dot(x, w)
++    tl.store(
++        YP + rows[:, None] * SY_U + cols[None, :],
++        acc.to(YP.dtype.element_ty),
++        (rows[:, None] < M) & cmask[None, :],
++    )
++
++
++def sm80_seg3_dyn_gemv(
++    xs: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
++    weight: torch.Tensor,
++    widths: tuple[int, int, int],
++    wk_dyn: torch.Tensor,
++    wv_dyn: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
++    if (
++        not current_platform.is_device_capability_family(80)
++        or weight.dtype != torch.bfloat16
++        or wk_dyn.dtype != torch.bfloat16
++        or wv_dyn.dtype != torch.bfloat16
++    ):
++        return None
++    m, k = xs[0].shape[0], weight.shape[1]
++    n_dyn = wk_dyn.shape[0]
++    bn, bk, warps, stages = _sm80_seg3_tiles(m)
++    if (
++        not 0 < m <= SM80_MAX_M
++        or weight.stride(-1) != 1
++        or wk_dyn.stride(-1) != 1
++        or wv_dyn.stride(-1) != 1
++        or weight.shape[0] < sum(widths)
++        or wk_dyn.shape != (n_dyn, k)
++        or wv_dyn.shape != (n_dyn, k)
++        or n_dyn > bn
++    ):
++        return None
++    for x in xs:
++        if (
++            x.ndim != 2
++            or x.dtype != torch.bfloat16
++            or x.shape != (m, k)
++            or x.stride(-1) != 1
++            or x.device != weight.device
++        ):
++            return None
++    n = sum(widths)
++    out = torch.empty((m, n), device=weight.device, dtype=torch.bfloat16)
++    yk = torch.empty((m, n_dyn), device=weight.device, dtype=torch.bfloat16)
++    yv = torch.empty((m, n_dyn), device=weight.device, dtype=torch.bfloat16)
++    mp = 16 if m <= 16 else (32 if m <= 32 else 64)
++    nb0, nb1, nb2 = (triton.cdiv(w, bn) for w in widths)
++    _seg3_dyn_gemv_kernel[(nb0 + nb1 + nb2 + 2,)](
++        xs[0],
++        xs[1],
++        xs[2],
++        weight,
++        wk_dyn,
++        wv_dyn,
++        out,
++        yk,
++        yv,
++        m,
++        k,
++        xs[0].stride(0),
++        xs[1].stride(0),
++        xs[2].stride(0),
++        weight.stride(0),
++        wk_dyn.stride(0),
++        wv_dyn.stride(0),
++        out.stride(0),
++        widths[0],
++        widths[1],
++        widths[2],
++        n_dyn,
++        nb0,
++        nb1,
++        nb2,
++        BN=bn,
++        BK=bk,
++        MP=mp,
++        num_warps=warps,
++        num_stages=stages,
++    )
++    return out, yk, yv
++
++
++@triton.jit
++def _ctrl_gf_blend_kernel(
++    P,
++    W,
++    Dest,
++    Msg,
++    OutX,
++    M,
++    D: tl.constexpr,
++    SWS,
++    SWN,
++    stride_dest_s,
++    SPLITS: tl.constexpr,
++    R: tl.constexpr,
++    BN: tl.constexpr,
++    MP: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    s = tl.program_id(1)
++    S = tl.num_programs(1)
++    rows = tl.arange(0, MP)
++    rk = tl.arange(0, R)
++    h = tl.zeros((MP, R), tl.float32)
++    for sp in tl.static_range(SPLITS):
++        h += tl.load(P + ((sp * S + s) * MP + rows[:, None]) * R + rk[None, :])
++    h = h.to(tl.bfloat16)
++
++    cols = pid * BN + tl.arange(0, BN)
++    cmask = cols < D
++    rmask = rows < M
++    mask = rmask[:, None] & cmask[None, :]
++
++    w_base = W + s.to(tl.int64) * SWS
++    wg = tl.load(
++        w_base + cols[None, :].to(tl.int64) * SWN + rk[:, None], cmask[None, :], other=0
++    )
++    wf = tl.load(
++        w_base + (D + cols[None, :]).to(tl.int64) * SWN + rk[:, None],
++        cmask[None, :],
++        other=0,
++    )
++    gain = tldevice.tanh(tl.dot(h, wg))
++    forget = tldevice.tanh(tl.dot(h, wf))
++
++    dest = tl.load(
++        Dest + s.to(tl.int64) * stride_dest_s + rows[:, None] * D + cols[None, :],
++        mask,
++        other=0.0,
++    )
++    msg = tl.load(
++        Msg + (s.to(tl.int64) * M + rows[:, None]) * D + cols[None, :], mask, other=0.0
++    )
++    x = (1.0 - forget) * dest + gain * msg
++    tl.store(
++        OutX + (s.to(tl.int64) * M + rows[:, None]) * D + cols[None, :], x, mask
++    )
++
++
++@triton.jit
++def _ctrl_gf_blend_prefill_kernel(
++    H,
++    W,
++    Dest,
++    Msg,
++    OutX,
++    M,
++    D: tl.constexpr,
++    R: tl.constexpr,
++    SHS,
++    SHM,
++    SWS,
++    SWN,
++    stride_dest_s,
++    BM: tl.constexpr,
++    BN: tl.constexpr,
++):
++    """Fused gain/forget projection + tanh + blend for large M (prefill & 8u S=1).
++    Eliminates materializing the fp32 (S, M, 2*D) gain_forget tensor (~453 MB at 8k)."""
++    pid_m = tl.program_id(0)
++    pid_n = tl.program_id(1)
++    s = tl.program_id(2)
++    rows = pid_m * BM + tl.arange(0, BM)
++    cols = pid_n * BN + tl.arange(0, BN)
++    rk = tl.arange(0, R)
++    rmask = rows < M
++    cmask = cols < D
++    mask = rmask[:, None] & cmask[None, :]
++
++    h = tl.load(
++        H + s.to(tl.int64) * SHS + rows[:, None].to(tl.int64) * SHM + rk[None, :],
++        rmask[:, None],
++        other=0,
++    )
++    w_base = W + s.to(tl.int64) * SWS
++    wg = tl.load(
++        w_base + cols[None, :].to(tl.int64) * SWN + rk[:, None], cmask[None, :], other=0
++    )
++    wf = tl.load(
++        w_base + (D + cols[None, :]).to(tl.int64) * SWN + rk[:, None],
++        cmask[None, :],
++        other=0,
++    )
++    gain = tldevice.tanh(tl.dot(h, wg))
++    forget = tldevice.tanh(tl.dot(h, wf))
++
++    dest = tl.load(
++        Dest
++        + s.to(tl.int64) * stride_dest_s
++        + rows[:, None].to(tl.int64) * D
++        + cols[None, :],
++        mask,
++        other=0.0,
++    )
++    msg = tl.load(
++        Msg + (s.to(tl.int64) * M + rows[:, None]).to(tl.int64) * D + cols[None, :],
++        mask,
++        other=0.0,
++    )
++    x = (1.0 - forget) * dest + gain * msg
++    tl.store(
++        OutX + (s.to(tl.int64) * M + rows[:, None]).to(tl.int64) * D + cols[None, :],
++        x,
++        mask,
++    )
++
++
++@triton.jit
++def _ctrl_gf_blend_direct_h_kernel(
++    H,
++    W,
++    Dest,
++    Msg,
++    OutX,
++    M,
++    D: tl.constexpr,
++    SWS,
++    SWN,
++    stride_dest_s,
++    R: tl.constexpr,
++    BN: tl.constexpr,
++    MP: tl.constexpr,
++):
++    """One-token decode: direct-H gain/forget+blend (reads bf16 H directly, no SPLITS reduction)."""
++    pid = tl.program_id(0)
++    s = tl.program_id(1)
++    rows = tl.arange(0, MP)
++    rk = tl.arange(0, R)
++    rmask = rows < M
++    h = tl.load(
++        H + (s.to(tl.int64) * M + rows[:, None]) * R + rk[None, :],
++        rmask[:, None],
++        other=0,
++    )
++    cols = pid * BN + tl.arange(0, BN)
++    cmask = cols < D
++    mask = rmask[:, None] & cmask[None, :]
++
++    w_base = W + s.to(tl.int64) * SWS
++    wg = tl.load(
++        w_base + cols[None, :].to(tl.int64) * SWN + rk[:, None], cmask[None, :], other=0
++    )
++    wf = tl.load(
++        w_base + (D + cols[None, :]).to(tl.int64) * SWN + rk[:, None],
++        cmask[None, :],
++        other=0,
++    )
++    gain = tldevice.tanh(tl.dot(h, wg))
++    forget = tldevice.tanh(tl.dot(h, wf))
++
++    dest = tl.load(
++        Dest + s.to(tl.int64) * stride_dest_s + rows[:, None] * D + cols[None, :],
++        mask,
++        other=0.0,
++    )
++    msg = tl.load(
++        Msg + (s.to(tl.int64) * M + rows[:, None]) * D + cols[None, :], mask, other=0.0
++    )
++    x = (1.0 - forget) * dest + gain * msg
++    tl.store(
++        OutX + (s.to(tl.int64) * M + rows[:, None]) * D + cols[None, :], x, mask
++    )
++
++
++@triton.jit
++def _ctrl_gf_blend_prefill_rank2_kernel(
++    H,
++    W,
++    Dest,
++    Bank,
++    CRaw,
++    OutX,
++    M,
++    D: tl.constexpr,
++    R: tl.constexpr,
++    SHS,
++    SHM,
++    SWS,
++    SWN,
++    stride_dest_s,
++    stride_bank_0,
++    BM: tl.constexpr,
++    BN: tl.constexpr,
++):
++    """Rank-2 prefill gain/forget+blend: reconstructs msg = c0*bank[0] + c1*bank[1] on the fly."""
++    pid_m = tl.program_id(0)
++    pid_n = tl.program_id(1)
++    s = tl.program_id(2)
++    rows = pid_m * BM + tl.arange(0, BM)
++    cols = pid_n * BN + tl.arange(0, BN)
++    rk = tl.arange(0, R)
++    rmask = rows < M
++    cmask = cols < D
++    mask = rmask[:, None] & cmask[None, :]
++
++    h = tl.load(
++        H + s.to(tl.int64) * SHS + rows[:, None].to(tl.int64) * SHM + rk[None, :],
++        rmask[:, None],
++        other=0,
++    )
++    w_base = W + s.to(tl.int64) * SWS
++    wg = tl.load(
++        w_base + cols[None, :].to(tl.int64) * SWN + rk[:, None], cmask[None, :], other=0
++    )
++    wf = tl.load(
++        w_base + (D + cols[None, :]).to(tl.int64) * SWN + rk[:, None],
++        cmask[None, :],
++        other=0,
++    )
++    gain = tldevice.tanh(tl.dot(h, wg))
++    forget = tldevice.tanh(tl.dot(h, wf))
++
++    dest = tl.load(
++        Dest
++        + s.to(tl.int64) * stride_dest_s
++        + rows[:, None].to(tl.int64) * D
++        + cols[None, :],
++        mask,
++        other=0.0,
++    )
++    c_off = (s.to(tl.int64) * M + rows).to(tl.int64) * 2
++    c0 = tl.load(CRaw + c_off, rmask, other=0.0)
++    c1 = tl.load(CRaw + c_off + 1, rmask, other=0.0)
++    b_off = rows[:, None].to(tl.int64) * D + cols[None, :]
++    b0 = tl.load(Bank + b_off, mask, other=0).to(tl.float32)
++    b1 = tl.load(Bank + stride_bank_0 + b_off, mask, other=0).to(tl.float32)
++    msg = c0[:, None] * b0 + c1[:, None] * b1
++    x = (1.0 - forget) * dest + gain * msg
++    tl.store(
++        OutX + (s.to(tl.int64) * M + rows[:, None]).to(tl.int64) * D + cols[None, :],
++        x,
++        mask,
++    )
++
++
++def sm80_blend_rms_norm_rank2(
++    dest: torch.Tensor,
++    bank: torch.Tensor,
++    c_raw: torch.Tensor,
++    c_norm: torch.Tensor,
++    down: torch.Tensor,
++    gain_forget: torch.Tensor,
++    norm_weight: torch.Tensor,
++    norm_eps: float,
++) -> torch.Tensor | None:
++    """sm_80: rank-2 prefill controller blend + RMSNorm (no materialized [S, T, D] fp32 messages)."""
++    if (
++        not _SM80_HAS_CUDA
++        or not current_platform.is_device_capability_family(80)
++        or os.environ.get("INKLING_SM80_NO_HYBRID_BLEND") == "1"
++        or dest.dtype != torch.float32
++        or bank.dtype != torch.bfloat16
++        or c_raw.dtype != torch.float32
++        or c_norm.dtype != torch.float32
++        or down.dtype != torch.bfloat16
++        or gain_forget.dtype != torch.bfloat16
++        or norm_weight.dtype != torch.bfloat16
++        or dest.ndim != 3
++        or bank.ndim != 3
++        or bank.shape[0] != 2
++    ):
++        return None
++    s, m, d = dest.shape
++    r = down.shape[1]
++    if (
++        d != 2304
++        or m <= 0
++        or bank.shape[1] != m
++        or bank.shape[2] != d
++        or c_raw.shape != (s, m, 2)
++        or c_norm.shape != (s, m, 2)
++        or not c_raw.is_contiguous()
++        or not c_norm.is_contiguous()
++        or r not in (16, 32, 64, 128)
++        or down.shape != (s, r, 2 * d)
++        or gain_forget.shape != (s, 2 * d, r)
++        or norm_weight.shape != (s, d)
++        or dest.stride(1) != d
++        or dest.stride(2) != 1
++        or bank.stride(1) != d
++        or bank.stride(2) != 1
++        or down.stride(-1) != 1
++        or gain_forget.stride(-1) != 1
++        or norm_weight.stride(1) != 1
++    ):
++        return None
++    pair = _sm80_pair_rms_norm_rank2(dest, bank, c_norm, 1e-6)
++    hidden = torch.bmm(pair, down.transpose(1, 2))
++    del pair
++    x_tmp = torch.empty((s, m, d), device=dest.device, dtype=torch.float32)
++    if m >= 128:
++        bm, bn, nw, ns = (64, 64, 4, 3) if r >= 128 else (32, 64, 4, 4)
++    else:
++        bm, bn, nw, ns = 16, 64, 4, 3
++    _ctrl_gf_blend_prefill_rank2_kernel[(triton.cdiv(m, bm), triton.cdiv(d, bn), s)](
++        hidden,
++        gain_forget,
++        dest,
++        bank,
++        c_raw,
++        x_tmp,
++        m,
++        d,
++        r,
++        hidden.stride(0),
++        hidden.stride(1),
++        gain_forget.stride(0),
++        gain_forget.stride(1),
++        dest.stride(0),
++        bank.stride(0),
++        BM=bm,
++        BN=bn,
++        num_warps=nw,
++        num_stages=ns,
++        enable_fp_fusion=False,
++    )
++    return _sm80_rms_norm_f32_to_bf16(x_tmp, norm_weight, norm_eps)
++
++
++def sm80_blend_rms_norm(
++    dest: torch.Tensor,
++    message: torch.Tensor,
++    down: torch.Tensor,
++    gain_forget: torch.Tensor,
++    norm_weight: torch.Tensor,
++    norm_eps: float,
++) -> torch.Tensor | None:
++    """sm_80 hybrid fused loop message controller blend + RMSNorm for ALL M (decode & prefill)."""
++    if (
++        not _SM80_HAS_CUDA
++        or not current_platform.is_device_capability_family(80)
++        or os.environ.get("INKLING_SM80_NO_HYBRID_BLEND") == "1"
++        or dest.dtype != torch.float32
++        or message.dtype != torch.float32
++        or down.dtype != torch.bfloat16
++        or gain_forget.dtype != torch.bfloat16
++        or norm_weight.dtype != torch.bfloat16
++        or dest.ndim != 3
++        or message.ndim != 3
++        or dest.shape != message.shape
++    ):
++        return None
++    s, m, d = message.shape
++    r = down.shape[1]
++    if (
++        d != 2304
++        or m <= 0
++        or r not in (16, 32, 64, 128)
++        or down.shape != (s, r, 2 * d)
++        or gain_forget.shape != (s, 2 * d, r)
++        or norm_weight.shape != (s, d)
++        or dest.stride(1) != d
++        or dest.stride(2) != 1
++        or not message.is_contiguous()
++        or down.stride(-1) != 1
++        or gain_forget.stride(-1) != 1
++        or norm_weight.stride(1) != 1
++    ):
++        return None
++    x_tmp = torch.empty((s, m, d), device=dest.device, dtype=torch.float32)
++
++    # 1u decode 3-kernel fast path (S == 1, M <= 8): fuses pair_rms_norm + ctrl_down directly into bf16 H (1.08x)
++    if s == 1 and m <= 8 and os.environ.get("INKLING_SM80_NO_FUSED_PNCD") != "1":
++        hidden = _sm80_fused_pair_norm_ctrl_down(dest, message, down, 1e-6)
++        _ctrl_gf_blend_direct_h_kernel[(triton.cdiv(d, 32), s)](
++            hidden,
++            gain_forget,
++            dest,
++            message,
++            x_tmp,
++            m,
++            d,
++            gain_forget.stride(0),
++            gain_forget.stride(1),
++            dest.stride(0),
++            R=r,
++            BN=32,
++            MP=16,
++            num_warps=4,
++            num_stages=3,
++            enable_fp_fusion=False,
++        )
++        return _sm80_rms_norm_f32_to_bf16(x_tmp, norm_weight, norm_eps)
++
++    from .loop import pair_rms_norm
++
++    pair = pair_rms_norm(dest, message)
++
++    if m <= (SM80_MAX_M if s > 1 else 20):
++        mp = 16 if m <= 16 else (32 if m <= 32 else 64)
++        if s > 1:
++            splits = 6
++            if m <= 16:
++                bnd, bkd, w_d, st_d, bngf, w_gf = 32, 128, 4, 3, 32, 4
++            else:
++                bnd, bkd, w_d, st_d, bngf, w_gf = 64, 128, 4, 4, 32, 4
++        else:
++            splits = 8
++            bnd, bkd, w_d, st_d, bngf, w_gf = 32, 128, 4, 3, 32, 4
++        part = torch.empty((splits, s, mp, r), device=dest.device, dtype=torch.float32)
++        k_per = triton.cdiv(triton.cdiv(2 * d, splits), bkd) * bkd
++        _ctrl_down_kernel[(triton.cdiv(r, bnd), splits, s)](
++            pair,
++            down,
++            part,
++            m,
++            r,
++            2 * d,
++            pair.stride(0),
++            pair.stride(1),
++            down.stride(0),
++            down.stride(1),
++            K_PER=k_per,
++            BN=bnd,
++            BK=bkd,
++            MP=mp,
++            num_warps=w_d,
++            num_stages=st_d,
++        )
++        _ctrl_gf_blend_kernel[(triton.cdiv(d, bngf), s)](
++            part,
++            gain_forget,
++            dest,
++            message,
++            x_tmp,
++            m,
++            d,
++            gain_forget.stride(0),
++            gain_forget.stride(1),
++            dest.stride(0),
++            SPLITS=splits,
++            R=r,
++            BN=bngf,
++            MP=mp,
++            num_warps=w_gf,
++            num_stages=3,
++            enable_fp_fusion=False,
++        )
++    else:
++        # Large M (prefill & 8u S=1): cuBLAS bmm for down_proj, fused Triton gain/forget+blend
++        # (32, 32, w=2, s=3) beats (64, 128, w=4, s=3) by 1.5-1.6x in prefill (-14ms/chunk)
++        hidden = torch.bmm(pair, down.transpose(1, 2))
++        if m >= 128:
++            bm, bn, nw = 32, 32, 2
++        else:
++            bm, bn, nw = 16, 64, 4
++        _ctrl_gf_blend_prefill_kernel[(triton.cdiv(m, bm), triton.cdiv(d, bn), s)](
++            hidden,
++            gain_forget,
++            dest,
++            message,
++            x_tmp,
++            m,
++            d,
++            r,
++            hidden.stride(0),
++            hidden.stride(1),
++            gain_forget.stride(0),
++            gain_forget.stride(1),
++            dest.stride(0),
++            BM=bm,
++            BN=bn,
++            num_warps=nw,
++            num_stages=3,
++            enable_fp_fusion=False,
++        )
++    return _sm80_rms_norm_f32_to_bf16(x_tmp, norm_weight, norm_eps)
++
++
++@triton.jit
++def _lm_head_softcap_kernel(
++    X,
++    W,
++    B,
++    Y,
++    M,
++    N,
++    K,
++    SX,
++    SW,
++    SY,
++    softcap,
++    HAS_BIAS: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++    MP: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    cols = pid * BN + tl.arange(0, BN)
++    rows = tl.arange(0, MP)
++    cmask = cols < N
++    rmask = rows < M
++    acc = tl.zeros((MP, BN), tl.float32)
++    for k0 in range(0, K, BK):
++        ks = k0 + tl.arange(0, BK)
++        w = tl.load(
++            W + cols[None, :].to(tl.int64) * SW + ks[:, None],
++            cmask[None, :] & (ks[:, None] < K),
++            other=0,
++        )
++        x = tl.load(
++            X + rows[:, None] * SX + ks[None, :],
++            rmask[:, None] & (ks[None, :] < K),
++            other=0,
++        )
++        acc += tl.dot(x, w)
++    if HAS_BIAS:
++        acc += tl.load(B + cols, cmask, other=0).to(tl.float32)[None, :]
++    acc = tldevice.tanh(acc / softcap) * softcap
++    tl.store(
++        Y + rows[:, None] * SY + cols[None, :], acc, rmask[:, None] & cmask[None, :]
++    )
++
++
++def sm80_lm_head_softcap(
++    x: torch.Tensor,
++    weight: torch.Tensor,
++    bias: torch.Tensor | None,
++    softcap: float,
++) -> torch.Tensor | None:
++    """sm_80: fused fp32 lm_head GEMV + softcap(tanh(x/c)*c) for M <= 64 (bit-exact)."""
++    if (
++        not current_platform.is_device_capability_family(80)
++        or not x.is_cuda
++        or weight.device != x.device
++        or x.dtype != torch.bfloat16
++        or weight.dtype != torch.bfloat16
++        or x.ndim < 2
++        or weight.ndim != 2
++        or x.shape[-1] != weight.shape[1]
++        or x.stride(-1) != 1
++        or weight.stride(-1) != 1
++    ):
++        return None
++    if bias is not None and (bias.device != x.device or bias.stride(0) != 1):
++        return None
++    lead = x.shape[:-1]
++    x2 = x.reshape(-1, x.shape[-1])
++    m, k = x2.shape
++    if not 0 < m <= SM80_MAX_M:
++        return None
++    n = weight.shape[0]
++    out = torch.empty((m, n), device=x.device, dtype=torch.float32)
++    if m <= 16:
++        mp, bn, bk, warps, stages = 16, 64, 256, 8, 4
++    elif m <= 32:
++        mp, bn, bk, warps, stages = 32, 128, 128, 4, 3
++    else:
++        mp, bn, bk, warps, stages = 64, 128, 128, 4, 4
++    _lm_head_softcap_kernel[(triton.cdiv(n, bn),)](
++        x2,
++        weight,
++        bias if bias is not None else x2,
++        out,
++        m,
++        n,
++        k,
++        x2.stride(0),
++        weight.stride(0),
++        out.stride(0),
++        float(softcap),
++        HAS_BIAS=bias is not None,
++        BN=bn,
++        BK=bk,
++        MP=mp,
++        num_warps=warps,
++        num_stages=stages,
++    )
++    return out.view(*lead, n)
++
++
++def sm80_draft_base_logits(
++    x: torch.Tensor, weight: torch.Tensor
++) -> torch.Tensor | None:
++    """sm_80: bf16 draft base_logits GEMV up to M <= 64 (beats cuBLAS by -95us at 8u M=32!)."""
++    if (
++        not current_platform.is_device_capability_family(80)
++        or not x.is_cuda
++        or weight.device != x.device
++        or x.dtype != torch.bfloat16
++        or weight.dtype != torch.bfloat16
++        or x.ndim < 2
++        or weight.ndim != 2
++        or x.shape[-1] != weight.shape[1]
++        or x.stride(-1) != 1
++        or weight.stride(-1) != 1
++    ):
++        return None
++    lead = x.shape[:-1]
++    x2 = x.reshape(-1, x.shape[-1])
++    m, k = x2.shape
++    if not 0 < m <= SM80_MAX_M:
++        return None
++    n = weight.shape[0]
++    out = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
++    mp = 16 if m <= 16 else (32 if m <= 32 else 64)
++    bn, bk, warps, stages = _sm80_tiles(n, k, m)
++    _gemv_kernel[(triton.cdiv(n, bn),)](
++        x2,
++        weight,
++        x2,
++        out,
++        m,
++        n,
++        k,
++        x2.stride(0),
++        weight.stride(0),
++        out.stride(0),
++        HAS_BIAS=False,
++        BN=bn,
++        BK=bk,
++        MP=mp,
++        num_warps=warps,
++        num_stages=stages,
++    )
++    return out.view(*lead, n)
++
++
++@triton.jit
++def _gemv_splitk_kernel(
++    X,
++    W,
++    P,
++    M,
++    N,
++    K,
++    SX,
++    SW,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++    MP: tl.constexpr,
++    K_PER: tl.constexpr,
++):
++    pid_n = tl.program_id(0)
++    pid_k = tl.program_id(1)
++    cols = pid_n * BN + tl.arange(0, BN)
++    rows = tl.arange(0, MP)
++    acc = tl.zeros((MP, BN), tl.float32)
++    k_start = pid_k * K_PER
++    k_end = tl.minimum(k_start + K_PER, K)
++    for k0 in range(k_start, k_end, BK):
++        ks = k0 + tl.arange(0, BK)
++        w = tl.load(
++            W + cols[None, :].to(tl.int64) * SW + ks[:, None],
++            (cols[None, :] < N) & (ks[:, None] < K),
++            other=0,
++        )
++        x = tl.load(
++            X + rows[:, None] * SX + ks[None, :],
++            (rows[:, None] < M) & (ks[None, :] < K),
++            other=0,
++        )
++        acc += tl.dot(x, w)
++    tl.store(
++        P + (pid_k * M + rows[:, None]).to(tl.int64) * N + cols[None, :],
++        acc,
++        (rows[:, None] < M) & (cols[None, :] < N),
++    )
++
++
++@triton.jit
++def _splitk_reduce_kernel(
++    P, Y, M, N, SY, SPLIT_K: tl.constexpr, BLOCK: tl.constexpr
++):
++    row = tl.program_id(1).to(tl.int64)
++    cols = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
++    mask = cols < N
++    acc = tl.zeros((BLOCK,), tl.float32)
++    for sp in tl.static_range(SPLIT_K):
++        acc += tl.load(P + ((sp * M + row) * N + cols).to(tl.int64), mask, other=0.0)
++    tl.store(Y + row * SY + cols, acc.to(Y.dtype.element_ty), mask)
++
++
++def sm80_draft_dn_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor | None:
++    """sm_80: split-K=2 Triton GEMM for draft MLP down_proj (N=2304, K=9216) at 16 < M <= 64."""
++    if (
++        not current_platform.is_device_capability_family(80)
++        or not x.is_cuda
++        or weight.device != x.device
++        or x.dtype != torch.bfloat16
++        or weight.dtype != torch.bfloat16
++        or x.ndim != 2
++        or weight.ndim != 2
++        or x.stride(-1) != 1
++        or weight.stride(-1) != 1
++    ):
++        return None
++    m, k = x.shape
++    n = weight.shape[0]
++    if not (16 < m <= SM80_MAX_M and k == weight.shape[1] and k >= 8192 and n <= 4096):
++        return None
++    sk, bn, bk = 2, 64, 128
++    mp = 32 if m <= 32 else 64
++    k_per = triton.cdiv(triton.cdiv(k, sk), bk) * bk
++    part = torch.empty((sk, m, n), device=x.device, dtype=torch.float32)
++    out = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
++    _gemv_splitk_kernel[(triton.cdiv(n, bn), sk)](
++        x,
++        weight,
++        part,
++        m,
++        n,
++        k,
++        x.stride(0),
++        weight.stride(0),
++        BN=bn,
++        BK=bk,
++        MP=mp,
++        K_PER=k_per,
++        num_warps=4,
++        num_stages=3,
++    )
++    _splitk_reduce_kernel[(triton.cdiv(n, 512), m)](
++        part, out, m, n, out.stride(0), SPLIT_K=sk, BLOCK=512, num_warps=4
++    )
++    return out
++
++
++@triton.jit
++def _ctrl_down_kernel(
++    X,
++    W,
++    P,
++    M,
++    N,
++    K,
++    SXS,
++    SXM,
++    SWS,
++    SWN,
++    K_PER: tl.constexpr,
++    BN: tl.constexpr,
++    BK: tl.constexpr,
++    MP: tl.constexpr,
++):
 +    pid = tl.program_id(0)
 +    split = tl.program_id(1)
 +    s = tl.program_id(2)
@@ -273,18 +3248,40 @@
 +    acc = tl.zeros((MP, BN), tl.float32)
 +    for k0 in range(split * K_PER, tl.minimum(split * K_PER + K_PER, K), BK):
 +        ks = k0 + tl.arange(0, BK)
-+        w = tl.load(W + s.to(tl.int64) * SWS + cols[None, :].to(tl.int64) * SWN + ks[:, None],
-+                    (cols[None, :] < N) & (ks[:, None] < K), other=0)
-+        x = tl.load(X + s.to(tl.int64) * SXS + rows[:, None] * SXM + ks[None, :],
-+                    (rows[:, None] < M) & (ks[None, :] < K), other=0)
++        w = tl.load(
++            W + s.to(tl.int64) * SWS + cols[None, :].to(tl.int64) * SWN + ks[:, None],
++            (cols[None, :] < N) & (ks[:, None] < K),
++            other=0,
++        )
++        x = tl.load(
++            X + s.to(tl.int64) * SXS + rows[:, None] * SXM + ks[None, :],
++            (rows[:, None] < M) & (ks[None, :] < K),
++            other=0,
++        )
 +        acc += tl.dot(x, w)
-+    tl.store(P + ((split * S + s) * MP + rows[:, None]) * N + cols[None, :], acc, cols[None, :] < N)
++    tl.store(
++        P + ((split * S + s) * MP + rows[:, None]) * N + cols[None, :],
++        acc,
++        cols[None, :] < N,
++    )
 +
 +
 +@triton.jit
-+def _ctrl_gf_kernel(P, W, Y, M, N, SWS, SWN, SYS, SYM, SPLITS: tl.constexpr, R: tl.constexpr,
-+                    BN: tl.constexpr, MP: tl.constexpr):
-+    # Y[s] = bf16(sum of the partials)[s] @ W[s].T in fp32: hidden rounded to bf16 as torch.bmm's bf16 output.
++def _ctrl_gf_kernel(
++    P,
++    W,
++    Y,
++    M,
++    N,
++    SWS,
++    SWN,
++    SYS,
++    SYM,
++    SPLITS: tl.constexpr,
++    R: tl.constexpr,
++    BN: tl.constexpr,
++    MP: tl.constexpr,
++):
 +    pid = tl.program_id(0)
 +    s = tl.program_id(1)
 +    S = tl.num_programs(1)
@@ -295,19 +3292,22 @@
 +        h += tl.load(P + ((sp * S + s) * MP + rows[:, None]) * R + rk[None, :])
 +    h = h.to(tl.bfloat16)
 +    cols = pid * BN + tl.arange(0, BN)
-+    w = tl.load(W + s.to(tl.int64) * SWS + cols[None, :].to(tl.int64) * SWN + rk[:, None], cols[None, :] < N, other=0)
++    w = tl.load(
++        W + s.to(tl.int64) * SWS + cols[None, :].to(tl.int64) * SWN + rk[:, None],
++        cols[None, :] < N,
++        other=0,
++    )
 +    acc = tl.dot(h, w)
-+    tl.store(Y + s.to(tl.int64) * SYS + rows[:, None] * SYM + cols[None, :], acc, (rows[:, None] < M) & (cols[None, :] < N))
++    tl.store(
++        Y + s.to(tl.int64) * SYS + rows[:, None] * SYM + cols[None, :],
++        acc,
++        (rows[:, None] < M) & (cols[None, :] < N),
++    )
 +
 +
 +def sm80_controller_gain_forget(
 +    pair: torch.Tensor, down: torch.Tensor, gain_forget: torch.Tensor
 +) -> torch.Tensor | None:
-+    """sm_80 (Ampere): fp32 `bmm(bmm(pair, down.T), gain_forget.T)` of the loop message controllers
-+    (`Inkling2LoopDecoderLayer.blend`) for bf16 pair (S, M <= MAX_M, K), down (S, R, K), gain_forget (S, N, R), the
-+    hidden rounded to bf16 as there. cuBLAS gives the first product (N=64, K=4608) one block per stream: 18 us of
-+    25 for both at S=3; here the K slices run in parallel and the second kernel sums them (~10 us). None where it
-+    does not apply (the caller keeps torch.bmm)."""
 +    if (
 +        current_platform.has_device_capability(90)
 +        or pair.dtype != torch.bfloat16
@@ -330,64 +3330,156 @@
 +    n = gain_forget.shape[1]
 +    part = torch.empty((splits, s, 16, r), device=pair.device, dtype=torch.float32)
 +    k_per = triton.cdiv(triton.cdiv(k, splits), 64) * 64
-+    _ctrl_down_kernel[(triton.cdiv(r, 16), splits, s)](pair, down, part, m, r, k, pair.stride(0), pair.stride(1),
-+        down.stride(0), down.stride(1), K_PER=k_per, BN=16, BK=64, MP=16, num_warps=warps, num_stages=3)
++    _ctrl_down_kernel[(triton.cdiv(r, 16), splits, s)](
++        pair,
++        down,
++        part,
++        m,
++        r,
++        k,
++        pair.stride(0),
++        pair.stride(1),
++        down.stride(0),
++        down.stride(1),
++        K_PER=k_per,
++        BN=16,
++        BK=64,
++        MP=16,
++        num_warps=warps,
++        num_stages=3,
++    )
 +    out = torch.empty((s, m, n), device=pair.device, dtype=torch.float32)
-+    _ctrl_gf_kernel[(triton.cdiv(n, bn_gf), s)](part, gain_forget, out, m, n, gain_forget.stride(0), gain_forget.stride(1),
-+        out.stride(0), out.stride(1), SPLITS=splits, R=r, BN=bn_gf, MP=16, num_warps=4)
++    _ctrl_gf_kernel[(triton.cdiv(n, bn_gf), s)](
++        part,
++        gain_forget,
++        out,
++        m,
++        n,
++        gain_forget.stride(0),
++        gain_forget.stride(1),
++        out.stride(0),
++        out.stride(1),
++        SPLITS=splits,
++        R=r,
++        BN=bn_gf,
++        MP=16,
++        num_warps=4,
++    )
 +    return out
 +
 +
  def sm12x_bf16_gemv(
      x: torch.Tensor,
      weight: torch.Tensor,
-@@ -68,8 +225,11 @@
+@@ -64,12 +1291,15 @@
+     lead = x.shape[:-1]
+     x2 = x.reshape(-1, x.shape[-1])
+     m, k = x2.shape
+-    assert m <= MAX_M
      n = weight.shape[0]
      if out is None:
          out = torch.empty((m, n), device=x.device, dtype=out_dtype or x.dtype)
 +    bn, bk, warps, stages = _BN, _BK, 4, 3
++    mp = 16 if m <= 16 else (32 if m <= 32 else 64)
 +    if not current_platform.is_device_capability_family(120):
-+        bn, bk, warps, stages = _sm80_tiles(n, k)
++        bn, bk, warps, stages = _sm80_tiles(n, k, m)
      if m:
 -        _gemv_kernel[(triton.cdiv(n, _BN),)](
 +        _gemv_kernel[(triton.cdiv(n, bn),)](
              x2,
              weight,
              bias,
-@@ -81,10 +241,11 @@
+@@ -81,10 +1311,11 @@
              weight.stride(0),
              out.stride(0),
              HAS_BIAS=bias is not None,
 -            BN=_BN,
 -            BK=_BK,
+-            MP=16,
+-            num_warps=4,
 +            BN=bn,
 +            BK=bk,
-             MP=16,
--            num_warps=4,
++            MP=mp,
 +            num_warps=warps,
 +            num_stages=stages,
          )
      return out.view(*lead, n)
  
-@@ -109,5 +270,9 @@
+@@ -92,7 +1323,7 @@
+ def use_sm12x_bf16_gemv(
+     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None
+ ) -> bool:
+-    return (
++    if not (
+         x.is_cuda
+         and weight.device == x.device
+         and x.dtype == weight.dtype == torch.bfloat16
+@@ -100,7 +1331,6 @@
+         and weight.ndim == 2
+         and x.shape[-1] == weight.shape[1]
+         and x.stride(-1) == weight.stride(-1) == 1
+-        and 0 < x.numel() // x.shape[-1] <= MAX_M
+         and (
+             bias is None
+             or (
+@@ -109,5 +1339,29 @@
                  and bias.stride(0) == 1
              )
          )
 -        and current_platform.is_device_capability_family(120)
-+        and (
-+            current_platform.is_device_capability_family(120)
-+            # sm_80 (Ampere): faster than cuBLAS here too (_sm80_tiles).
-+            or current_platform.is_device_capability_family(80)
-+        )
-     )
+-    )
++    ):
++        return False
++    m = x.numel() // x.shape[-1]
++    if current_platform.is_device_capability_family(120):
++        return 0 < m <= MAX_M
++    if current_platform.is_device_capability_family(80):
++        if 0 < m <= MAX_M:
++            return True
++        if 16 < m <= SM80_MAX_M and bias is None:
++            n, k = weight.shape
++            # sm_80: Triton _gemv_kernel also beats cuBLAS + splitKreduce at 4u/8u (M=17..64) for:
++            # - qkvr_local (N~8576, K<=2560)
++            # - o_proj (N=2304, K=3072): 14.3/15.4us vs cuBLAS 17.1-22.7us (-0.14..0.35ms/step)
++            # - draft_dn (N=2304, K=8192): 36.8/40.4us vs cuBLAS 48.6/51.5us (-0.14ms/step)
++            # - draft_up (N=16384, K=2304): 72.4/69.8us vs cuBLAS 75.1/75.4us (-67us/step)
++            # - draft_qkv (N=2560, K=2304, M<=32): 22.9us vs cuBLAS 24.2us
++            if 8000 <= n <= 10000 and k <= 2560:
++                return True
++            if n == 2304 and (k == 3072 or k == 8192):
++                return True
++            if n == 16384 and k == 2304:
++                return True
++            if n == 2560 and k == 2304 and m <= 32:
++                return True
++        return False
++    return False
 --- a/vllm/models/inkling2/nvidia/ops/linear.py
 +++ b/vllm/models/inkling2/nvidia/ops/linear.py
-@@ -214,7 +214,9 @@
+@@ -5,6 +5,7 @@
+ 
+ import torch
+ 
++import vllm.envs as envs
+ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.flashinfer import is_flashinfer_autotuning
+@@ -213,8 +214,19 @@
+     assert x.is_contiguous() and weight.is_contiguous()
      tokens, hidden = x.shape
      n = weight.shape[0]
++    # sm_80: cuBLAS fp32 GEMM is 1.6-10x faster than Triton _k_group_kernel
++    # for prefill-sized batches (tokens >= 512) with 100.00% identical top-8 routing (md ~ 1e-5).
++    if (
++        tokens >= 512
++        and current_platform.is_device_capability_family(80)
++        and not envs.VLLM_BATCH_INVARIANT
++        and x.dtype == weight.dtype == torch.bfloat16
++    ):
++        return torch.mm(x, weight.t(), out_dtype=out_dtype).unsqueeze(0)
      sm120 = current_platform.is_device_capability_family(120)
 -    if tokens >= TMA_MIN_TOKENS and not sm120:
-+    # sm_80 (Ampere): no TMA before Hopper, so take the SM12x branch there too.
++    # 170HX (sm_80): no TMA before Hopper, so take the SM12x branch there too.
 +    no_tma = sm120 or not current_platform.has_device_capability(90)
 +    if tokens >= TMA_MIN_TOKENS and not no_tma:
          from triton.tools.tensor_descriptor import TensorDescriptor
@@ -395,7 +3487,7 @@
          out = torch.empty((1, tokens, n), dtype=out_dtype, device=x.device)
 --- a/vllm/models/inkling2/nvidia/ops/moe_sm90.py
 +++ b/vllm/models/inkling2/nvidia/ops/moe_sm90.py
-@@ -9,14 +9,29 @@
+@@ -9,20 +9,44 @@
  """
  
  import json
@@ -413,7 +3505,7 @@
 +
 +
 +def moe_align_block_size(ids, block_size, num_experts, ignore_invalid_experts=False):
-+    # sm_80 (Ampere): the image's compiled moe_align_block_size has sm_100 kernels only and silently
++    # 170HX (sm_80), 21 Nov 2026: the image's compiled moe_align_block_size has sm_100 kernels only and silently
 +    # returns garbage before Hopper; use the Triton/torch version from the sm_80 shims there (same contract for this call).
 +    if current_platform.has_device_capability(90):
 +        return _moe_align_block_size_compiled(
@@ -426,22 +3518,704 @@
  from vllm.triton_utils import tl, triton
  
  from .activation import _situ
-@@ -229,6 +244,15 @@
+ from .linear import k_group_partials
+ from .moe import _load_bias, _local_experts, _select_experts
+ 
++try:
++    from inkling_sm80_cuda import HAS_CUDA_EXT as _SM80_HAS_CUDA
++    from inkling_sm80_cuda import route_align_1k_cuda as _sm80_route_align_1k
++    from inkling_sm80_cuda import select_align_cuda as _sm80_select_align
++except Exception:
++    _SM80_HAS_CUDA = False
++    _sm80_route_align_1k = None
++    _sm80_select_align = None
++
+ if TYPE_CHECKING:
+     from vllm.utils.humming import HummingInputSchema
+ 
+@@ -108,6 +132,55 @@
+     return ids, weights, src2dst
+ 
+ 
++def select_and_align_experts_sm80(
++    x: torch.Tensor,
++    gate_weight: torch.Tensor,
++    bias: torch.Tensor,
++    topk: int,
++    route_scale: float,
++    num_local_experts: int,
++    ep_size: int,
++    is_padding: torch.Tensor | None = None,
++):
++    """sm_80 fused router + top-8 + block_m=8 align for single-GPU decode batches (T <= 32).
++
++    Returns ((ids, weights, src2dst), (sorted_ids, expert_ids, num_padded)) or None to fall back.
++    """
++    if (
++        not _SM80_HAS_CUDA
++        or not current_platform.is_device_capability_family(80)
++        or os.environ.get("INKLING_SM80_NO_CUDA_ROUTE") == "1"
++        or ep_size != 1
++        or num_local_experts != 128
++        or topk != 8
++        or x.dtype != torch.bfloat16
++        or gate_weight.dtype != torch.bfloat16
++        or bias.dtype != torch.float32
++        or x.shape[1] != 2304
++        or gate_weight.shape != (128, 2304)
++        or not x.is_contiguous()
++        or not gate_weight.is_contiguous()
++        or not bias.is_contiguous()
++    ):
++        return None
++    tokens = x.shape[0]
++    if is_padding is not None and (is_padding.dtype != torch.bool or not is_padding.is_contiguous()):
++        is_padding = is_padding.to(torch.bool).contiguous()
++    if 0 < tokens <= 8:
++        ids, weights, src2dst, sorted_ids, expert_ids, num_padded = _sm80_route_align_1k(
++            x, gate_weight, bias, is_padding, route_scale
++        )
++        return (ids, weights, src2dst), {8: (sorted_ids, expert_ids, num_padded)}
++    if 8 < tokens <= 64:
++        partials = k_group_partials(x, gate_weight)
++        bm = 16 if tokens > 28 else 8
++        ids, weights, src2dst, s_ids, e_ids, n_pad = _sm80_select_align(
++            partials, bias, is_padding, route_scale, block_size=bm
++        )
++        return (ids, weights, src2dst), {bm: (s_ids, e_ids, n_pad)}
++    return None
++
++
+ @triton.jit
+ def _swiglu_kernel(
+     GateUp,
+@@ -229,6 +302,109 @@
              # whose order (and so the result) changes from run to run.
              for _, _, kernel_config in tuning:
                  kernel_config["use_stream_k"] = False
-+            # sm_80 (Ampere): measured sweep (block n/k, stages, CTAs per SM, 192 configs) at decode sizes
-+            # (16-912 routed rows: drafts of 3-7 tokens for 1-8 users): 8x256x128 tiles, 4 stages, 2 CTAs per SM were
-+            # 5-14% faster than the heuristic configs. INKLING_SM80_HUMMING (JSON) overrides it; prefill sizes untouched.
++            # sm_80: 8-bucket real-skew Cold-L2 CG decode (1u/2u/4u/8u) + 180W steady-state prefill (2k/4k/8k/12k):
++            # Explicitly sets num_sms = device SM count (74 on 170HX) so small-bucket heuristics never halve active SMs
 +            if not current_platform.has_device_capability(90):
-+                override = json.loads(os.environ.get("INKLING_SM80_HUMMING") or "null") or {
-+                    "block_shape": [8, 256, 128], "warp_shape": [8, 64, 64], "num_stages": 4, "num_ctas_per_sm": 2}
-+                for lower, upper, kernel_config in tuning:
-+                    if lower >= 16 and upper <= 912:
-+                        kernel_config.update(override)
++                base_kc = dict(tuning[-1][2])
++                base_kc["use_stream_k"] = False
++                base_kc["num_sms"] = int(torch.cuda.get_device_properties(weight.device).multi_processor_count)
++                legacy = json.loads(os.environ.get("INKLING_SM80_HUMMING") or "null")
++                if name == "w13":
++                    # 1u (T=5, rows=40): real skewed routing favors [8,128,128]s3c4 NVFP4 & [8,64,128]s3c8 MXFP8
++                    default_s = (
++                        {"block_shape": [8, 128, 128], "warp_shape": [8, 64, 64], "num_stages": 3, "num_ctas_per_sm": 4}
++                        if nvfp4
++                        else {"block_shape": [8, 64, 128], "warp_shape": [8, 32, 64], "num_stages": 3, "num_ctas_per_sm": 8}
++                    )
++                    # 2u (T=10, rows=80)
++                    default_b2 = (
++                        {"block_shape": [8, 128, 128], "warp_shape": [8, 64, 64], "num_stages": 3, "num_ctas_per_sm": 4}
++                        if nvfp4
++                        else {"block_shape": [8, 64, 128], "warp_shape": [8, 32, 64], "num_stages": 3, "num_ctas_per_sm": 4}
++                    )
++                    # 4u (T=20, rows=160): [8,128,128]s3c4 beats [8,64,128] by +8..20 tok/s across all 4u workloads
++                    default_b4 = {"block_shape": [8, 128, 128], "warp_shape": [8, 64, 64], "num_stages": 3, "num_ctas_per_sm": 4}
++                    # 8u (T=40, rows=320): BM=16 beats BM=8 on skewed routing (175 vs 195us NVFP4; 245 vs 305us MXFP8)
++                    # Alignment for BM=16 is emitted for free inside sm80_select_align_mcta_kernel
++                    default_b8 = {"block_shape": [16, 128, 128], "warp_shape": [16, 64, 64], "num_stages": 3, "num_ctas_per_sm": 4}
++                    default_m = (
++                        {"block_shape": [32, 128, 64], "warp_shape": [32, 64, 32], "num_stages": 4, "num_ctas_per_sm": 2}
++                        if nvfp4
++                        else {"block_shape": [32, 256, 64], "warp_shape": [32, 64, 32], "num_stages": 4, "num_ctas_per_sm": 1}
++                    )
++                    # T=2048 (rows=16384, 180W steady)
++                    default_p2k = {"block_shape": [64, 128, 64], "warp_shape": [64, 64, 32], "num_stages": 3, "num_ctas_per_sm": 2}
++                    # T=4096 & T=8192 (rows=24576..73728, 180W steady): BK=64 beats BK=32 on real skewed routing
++                    default_p8k = (
++                        {"block_shape": [128, 256, 64], "warp_shape": [64, 64, 64], "num_stages": 4, "num_ctas_per_sm": 1}
++                        if nvfp4
++                        else {"block_shape": [128, 256, 64], "warp_shape": [64, 64, 64], "num_stages": 2, "num_ctas_per_sm": 1}
++                    )
++                    # T=12288 (rows > 73728, 180W steady)
++                    default_p12k = (
++                        {"block_shape": [128, 256, 64], "warp_shape": [64, 64, 64], "num_stages": 4, "num_ctas_per_sm": 1}
++                        if nvfp4
++                        else {"block_shape": [128, 256, 64], "warp_shape": [64, 64, 64], "num_stages": 2, "num_ctas_per_sm": 1}
++                    )
++                    small_ov = json.loads(os.environ.get("INKLING_SM80_HUMMING_W13_S") or "null") or legacy or default_s
++                    b2_ov = json.loads(os.environ.get("INKLING_SM80_HUMMING_W13_B2") or "null") or legacy or default_b2
++                    b4_ov = json.loads(os.environ.get("INKLING_SM80_HUMMING_W13_B4") or "null") or legacy or default_b4
++                    b8_ov = json.loads(os.environ.get("INKLING_SM80_HUMMING_W13_B") or "null") or legacy or default_b8
++                    med_ov = json.loads(os.environ.get("INKLING_SM80_HUMMING_W13_M") or "null") or default_m
++                    pre2k_ov = json.loads(os.environ.get("INKLING_SM80_HUMMING_W13_P2K") or "null") or default_p2k
++                    pre8k_ov = json.loads(os.environ.get("INKLING_SM80_HUMMING_W13_P") or "null") or default_p8k
++                    pre12k_ov = json.loads(os.environ.get("INKLING_SM80_HUMMING_W13_P12K") or "null") or default_p12k
++                else:
++                    # 1u (T=5, rows=40)
++                    default_s = (
++                        {"block_shape": [8, 64, 128], "warp_shape": [8, 32, 64], "num_stages": 4, "num_ctas_per_sm": 4}
++                        if nvfp4
++                        else {"block_shape": [8, 64, 128], "warp_shape": [8, 32, 64], "num_stages": 3, "num_ctas_per_sm": 4}
++                    )
++                    # 2u (T=10, rows=80)
++                    default_b2 = (
++                        {"block_shape": [8, 128, 64], "warp_shape": [8, 64, 32], "num_stages": 4, "num_ctas_per_sm": 4}
++                        if nvfp4
++                        else {"block_shape": [8, 64, 128], "warp_shape": [8, 32, 64], "num_stages": 3, "num_ctas_per_sm": 4}
++                    )
++                    # 4u (T=20, rows=160)
++                    default_b4 = (
++                        {"block_shape": [8, 128, 64], "warp_shape": [8, 64, 32], "num_stages": 4, "num_ctas_per_sm": 4}
++                        if nvfp4
++                        else {"block_shape": [8, 64, 128], "warp_shape": [8, 32, 64], "num_stages": 3, "num_ctas_per_sm": 4}
++                    )
++                    # 8u (T=40, rows=320): BM=16 beats BM=8 (NVFP4 96 vs 103us; MXFP8 122 vs 146us)
++                    default_b8 = (
++                        {"block_shape": [16, 128, 64], "warp_shape": [16, 64, 32], "num_stages": 4, "num_ctas_per_sm": 4}
++                        if nvfp4
++                        else {"block_shape": [16, 64, 128], "warp_shape": [16, 32, 64], "num_stages": 3, "num_ctas_per_sm": 4}
++                    )
++                    default_m = {"block_shape": [32, 128, 64], "warp_shape": [32, 64, 32], "num_stages": 4, "num_ctas_per_sm": 2}
++                    default_p2k = {"block_shape": [64, 128, 64], "warp_shape": [64, 64, 32], "num_stages": 4, "num_ctas_per_sm": 2}
++                    default_p8k = {"block_shape": [128, 256, 64], "warp_shape": [64, 64, 64], "num_stages": 2, "num_ctas_per_sm": 1}
++                    default_p12k = (
++                        {"block_shape": [128, 256, 64], "warp_shape": [64, 64, 64], "num_stages": 3, "num_ctas_per_sm": 1}
++                        if nvfp4
++                        else {"block_shape": [128, 256, 64], "warp_shape": [64, 64, 64], "num_stages": 2, "num_ctas_per_sm": 1}
++                    )
++                    small_ov = json.loads(os.environ.get("INKLING_SM80_HUMMING_W2_S") or "null") or legacy or default_s
++                    b2_ov = json.loads(os.environ.get("INKLING_SM80_HUMMING_W2_B2") or "null") or legacy or default_b2
++                    b4_ov = json.loads(os.environ.get("INKLING_SM80_HUMMING_W2_B4") or "null") or legacy or default_b4
++                    b8_ov = json.loads(os.environ.get("INKLING_SM80_HUMMING_W2_B") or "null") or legacy or default_b8
++                    med_ov = json.loads(os.environ.get("INKLING_SM80_HUMMING_W2_M") or "null") or default_m
++                    pre2k_ov = json.loads(os.environ.get("INKLING_SM80_HUMMING_W2_P2K") or "null") or default_p2k
++                    pre8k_ov = json.loads(os.environ.get("INKLING_SM80_HUMMING_W2_P") or "null") or default_p8k
++                    pre12k_ov = json.loads(os.environ.get("INKLING_SM80_HUMMING_W2_P12K") or "null") or default_p12k
++                tuning = [
++                    (0, 64, {**base_kc, **small_ov}),
++                    (64, 120, {**base_kc, **b2_ov}),
++                    (120, 224, {**base_kc, **b4_ov}),
++                    (224, 1840, {**base_kc, **b8_ov}),
++                    (1840, 4096, {**base_kc, **med_ov}),
++                    (4096, 24576, {**base_kc, **pre2k_ov}),
++                    (24576, 73728, {**base_kc, **pre8k_ov}),
++                    (73728, 1073741824, {**base_kc, **pre12k_ov}),
++                ]
              self.configs[name] = config
              self.tensors[name] = tensors
              self.tunings[name] = tuning
+@@ -257,6 +433,7 @@
+         alignment: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+         top_k: int,
+         valid_rows: int,
++        bias: torch.Tensor | None = None,
+     ) -> torch.Tensor:
+         from vllm.utils.humming import humming_forward
+ 
+@@ -272,6 +449,7 @@
+             weight=tensors["weight"],
+             weight_scale=tensors.get("weight_scale"),
+             weight_scale_2=tensors.get("weight_scale_2"),
++            bias=bias,
+             outputs=out,
+             locks=self.locks,
+             sorted_ids=sorted_ids,
+@@ -292,6 +470,7 @@
+         num_global_experts: int,
+         gate_cap: float,
+         up_cap: float,
++        alignment_8: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+     ) -> torch.Tensor:
+         """bf16 `[T * topk, H]` down-projection rows of the local slots of
+         `ids` (`select_experts`); the other rows are left unset."""
+@@ -300,17 +479,41 @@
+         # Expected local rows, which pick the kernel configs.
+         valid_rows = -(-rows * self.num_experts // num_global_experts)
+         block_m = {name: self._block_m(name, valid_rows) for name in ("w13", "w2")}
+-        alignments = {
+-            size: moe_align_block_size(
+-                ids, size, self.num_experts, ignore_invalid_experts=True
+-            )[:3]
+-            for size in set(block_m.values())
+-        }
+-        gate_up = self._gemm(
+-            "w13", x, rows, alignments[block_m["w13"]], topk, valid_rows
++        alignments: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
++        if alignment_8 is not None:
++            if isinstance(alignment_8, dict):
++                for sz, al in alignment_8.items():
++                    if sz in block_m.values():
++                        alignments[sz] = al
++            elif 8 in block_m.values():
++                alignments[8] = alignment_8
++        for size in set(block_m.values()):
++            if size not in alignments:
++                alignments[size] = moe_align_block_size(
++                    ids, size, self.num_experts, ignore_invalid_experts=True
++                )[:3]
++        use_fused_situ = (
++            not current_platform.has_device_capability(90)
++            and os.environ.get("INKLING_SM80_NO_FUSED_SITU") != "1"
++            and abs(gate_cap - 4.0) < 1e-6
++            and abs(up_cap - 25.0) < 1e-6
++            and weights.dtype == torch.float32
++            and weights.is_contiguous()
++            and self.configs["w13"].shape_n % 2 == 0
+         )
+-        activated = swiglu(gate_up, weights, src2dst, gate_cap, up_cap)
+-        del gate_up
++        if use_fused_situ:
++            raw = self._gemm(
++                "w13", x, rows, alignments[block_m["w13"]], topk, valid_rows, bias=weights
++            )
++            half_n = self.configs["w13"].shape_n // 2
++            activated = raw.view(-1)[: rows * half_n].view(rows, half_n)
++            del raw
++        else:
++            gate_up = self._gemm(
++                "w13", x, rows, alignments[block_m["w13"]], topk, valid_rows
++            )
++            activated = swiglu(gate_up, weights, src2dst, gate_cap, up_cap)
++            del gate_up
+         return self._gemm(
+             "w2", activated, rows, alignments[block_m["w2"]], 1, valid_rows
+         )
+--- a/vllm/models/inkling2/nvidia/ops/sconv.py
++++ b/vllm/models/inkling2/nvidia/ops/sconv.py
+@@ -553,6 +553,7 @@
+     BLOCK_E: tl.constexpr,
+     QR_TOKENS: tl.constexpr,
+     FUSE_QR: tl.constexpr,
++    SKIP_IDLE_CACHE: tl.constexpr = False,
+ ):
+     tl.extra.cuda.gdc_wait()
+     # The decode attention kernel prefetches cached keys meanwhile.
+@@ -634,6 +635,7 @@
+             D,
+             DYNAMIC,
+             BT,
++            SKIP_IDLE_CACHE,
+         )
+ 
+ 
+@@ -704,6 +706,219 @@
+ 
+ 
+ @triton.jit
++def _qr_clip_only_kernel(
++    q_ptr,
++    q_scale_ptr,
++    tau_ptr,
++    q_out_ptr,
++    T,
++    stride_q,
++    clip_threshold,
++    clip_eps,
++    HQ: tl.constexpr,
++    D: tl.constexpr,
++    HAS_TAU: tl.constexpr,
++    BLOCK_HQ: tl.constexpr,
++    BT: tl.constexpr,
++):
++    t0 = tl.program_id(0) * BT
++    heads = tl.arange(0, BLOCK_HQ)[:, None]
++    h_mask = heads < HQ
++    q_cols = tl.arange(0, D)[None, :]
++    q_sc = tl.load(
++        q_scale_ptr + heads * D + q_cols, mask=h_mask, other=0.0
++    ).to(tl.float32)
++    for i in tl.static_range(BT):
++        t = (t0 + i).to(tl.int64)
++        if t < T:
++            x = (
++                tl.load(
++                    q_ptr + t * stride_q + heads * D + q_cols,
++                    mask=h_mask,
++                    other=0.0,
++                ).to(tl.float32)
++                * q_sc
++            )
++            sum_sq = tl.sum(x * x, axis=1)
++            norm = tl.where(sum_sq > 0, sum_sq * rsqrt(sum_sq), 0.0)
++            y = x * tl.minimum(tl.div_rn(clip_threshold, norm + clip_eps), 1.0)[:, None]
++            if HAS_TAU:
++                tau = tl.load(tau_ptr + t)
++                y = y.to(q_ptr.dtype.element_ty).to(tl.float32) * tau
++            tl.store(
++                q_out_ptr + t * HQ * D + heads * D + q_cols,
++                y.to(q_out_ptr.dtype.element_ty),
++                mask=h_mask,
++            )
++
++
++@triton.jit
++def _rel_sheared_batched_kernel(
++    r_ptr,
++    r_scale_ptr,
++    tau_ptr,
++    rel_proj_ptr,
++    rel_out_ptr,
++    cu_seqlens_q_ptr,
++    seq_lens_ptr,
++    stride_r,
++    rel_threshold,
++    clip_eps,
++    HQ: tl.constexpr,
++    D_REL: tl.constexpr,
++    E: tl.constexpr,
++    SHIFT_W: tl.constexpr,
++    HAS_TAU: tl.constexpr,
++    BM: tl.constexpr,
++    TPC: tl.constexpr,
++    BLOCK_E: tl.constexpr,
++    CHUNKS_PER_PROG: tl.constexpr,
++):
++    """Same-diag batched relative logits for single-request prefill.
++
++    All full 128-token tiles share the exact same sheared diagonal column
++    `diag` for a given in-tile offset `r_mod in [0, 128)`, allowing `TPC`
++    tokens x `HQ` heads to share one `rel_proj` load and reuse `r_clip`
++    in registers across `CHUNKS_PER_PROG` column chunks.
++    """
++    E_PAD: tl.constexpr = E + 256
++    r_mod = tl.program_id(0)
++    k_grp = tl.program_id(1)
++    c_grp = tl.program_id(2)
++
++    q_start = tl.load(cu_seqlens_q_ptr)
++    q_end = tl.load(cu_seqlens_q_ptr + 1)
++    q_len = q_end - q_start
++    n_full = q_len // 128
++    k_base = k_grp * TPC
++    if k_base < n_full:
++        past = tl.load(seq_lens_ptr) - q_len
++
++        m_idx = tl.arange(0, BM)
++        tok_slot = m_idx // HQ
++        h_idx = m_idx % HQ
++        k = k_base + tok_slot
++        valid = (m_idx < TPC * HQ) & (k < n_full)
++        t = q_start + k * 128 + r_mod
++        safe_t = tl.where(valid, t, 0).to(tl.int64)
++
++        r_cols = tl.arange(0, D_REL)
++        r_val = tl.load(
++            r_ptr + safe_t[:, None] * stride_r + h_idx[:, None] * D_REL + r_cols[None, :],
++            mask=valid[:, None],
++            other=0.0,
++        ).to(tl.float32)
++        r_sc = tl.load(
++            r_scale_ptr + h_idx[:, None] * D_REL + r_cols[None, :],
++            mask=valid[:, None],
++            other=0.0,
++        ).to(tl.float32)
++        x = r_val * r_sc
++        sum_sq = tl.sum(x * x, axis=1)
++        norm = tl.where(sum_sq > 0, sum_sq * rsqrt(sum_sq), 0.0)
++        y = x * tl.minimum(tl.div_rn(rel_threshold, norm + clip_eps), 1.0)[:, None]
++        if HAS_TAU:
++            tau = tl.load(tau_ptr + safe_t, mask=valid, other=1.0)
++            y = y.to(r_ptr.dtype.element_ty).to(tl.float32) * tau[:, None]
++        r_clip = y.to(r_ptr.dtype.element_ty)
++
++        diag = past + r_mod + E_PAD - (tl.cdiv(past, 128) + 1) * 128
++        diag = tl.minimum(tl.maximum(diag, E + 1), E_PAD - 1)
++        diag8 = (diag // 8) * 8
++        table = (
++            rel_proj_ptr
++            + (diag - diag8) * (D_REL + 1) * SHIFT_W
++            + E
++            + 256
++            - diag8
++        )
++
++        e_idx = tl.arange(0, BLOCK_E)[None, :]
++        r_rows = tl.arange(0, D_REL)[:, None]
++        out_row_base = (
++            rel_out_ptr + safe_t[:, None] * (HQ * E_PAD) + h_idx[:, None] * E_PAD
++        )
++        c_start = c_grp * CHUNKS_PER_PROG
++        for ci in tl.static_range(CHUNKS_PER_PROG):
++            col = (c_start + ci) * BLOCK_E + e_idx
++            proj = tl.load(table + r_rows * SHIFT_W + col)
++            pad = tl.load(table + D_REL * SHIFT_W + col)
++            rel = tl.dot(r_clip, proj) + pad.to(tl.float32)
++            tl.store(
++                out_row_base + col,
++                rel.to(rel_out_ptr.dtype.element_ty),
++                mask=valid[:, None],
++            )
++    tl.extra.cuda.gdc_wait()
++
++
++@triton.jit
++def _qr_rel_tail_kernel(
++    q_ptr,
++    r_ptr,
++    q_scale_ptr,
++    r_scale_ptr,
++    tau_ptr,
++    rel_proj_ptr,
++    q_out_ptr,
++    rel_out_ptr,
++    seq_idx_ptr,
++    cu_seqlens_q_ptr,
++    seq_lens_ptr,
++    stride_q,
++    stride_r,
++    clip_threshold,
++    rel_threshold,
++    clip_eps,
++    HQ: tl.constexpr,
++    D: tl.constexpr,
++    D_REL: tl.constexpr,
++    E: tl.constexpr,
++    SHIFT_W: tl.constexpr,
++    HAS_TAU: tl.constexpr,
++    BLOCK_HQ: tl.constexpr,
++    BLOCK_E: tl.constexpr,
++    QR_TOKENS: tl.constexpr,
++):
++    q_start = tl.load(cu_seqlens_q_ptr)
++    q_end = tl.load(cu_seqlens_q_ptr + 1)
++    base = q_start + ((q_end - q_start) // 128) * 128
++    t0 = base + tl.program_id(0) * QR_TOKENS
++    if t0 < q_end:
++        qr_clip_rel_tokens(
++            t0,
++            QR_TOKENS,
++            tl.program_id(1),
++            q_end,
++            q_ptr,
++            r_ptr,
++            q_scale_ptr,
++            r_scale_ptr,
++            tau_ptr,
++            rel_proj_ptr,
++            q_out_ptr,
++            rel_out_ptr,
++            seq_idx_ptr,
++            cu_seqlens_q_ptr,
++            seq_lens_ptr,
++            stride_q,
++            stride_r,
++            clip_threshold,
++            rel_threshold,
++            clip_eps,
++            HQ,
++            D,
++            D_REL,
++            E,
++            SHIFT_W,
++            HAS_TAU,
++            BLOCK_HQ,
++            BLOCK_E,
++        )
++    tl.extra.cuda.gdc_wait()
++
++
++@triton.jit
+ def _kv_conv_tile(
+     k_ptr,
+     v_ptr,
+@@ -745,8 +960,14 @@
+     D: tl.constexpr,
+     DYNAMIC: tl.constexpr,
+     BT: tl.constexpr,
++    SKIP_IDLE_CACHE: tl.constexpr = False,
+ ):
+-    toff = tl.program_id(0) * BT + tl.arange(0, BT)
++    first = tl.program_id(0) * BT
++    tile_reads_cache = True
++    if SKIP_IDLE_CACHE:
++        last = tl.minimum(first + BT, T) - 1
++        tile_reads_cache = tl.load(qstart_ptr + last) > first - (W - 1)
++    toff = first + tl.arange(0, BT)
+     head = tl.program_id(1)
+     is_v = tl.program_id(2) == 1
+     d_idx = tl.arange(0, D)
+@@ -791,6 +1012,9 @@
+         dyn_ptr if DYNAMIC else None,
+         stride_dyn,
+         D,
++        SKIP_IDLE_CACHE=SKIP_IDLE_CACHE,
++        CACHE_FIRST=False,
++        tile_reads_cache=tile_reads_cache,
+     )
+     y = y.to(k_ptr.dtype.element_ty).to(tl.float32)
+     sum_sq = tl.sum(y * y, axis=1)
+@@ -907,8 +1131,14 @@
+     else:
+         width = k_weight.shape[1]
+         dyn_strides = (0, 0)
+-    block_t = _prologue_block_t(num_tokens)
++    prefill = num_tokens > 256
+     qr_tokens = _prologue_qr_tokens(num_tokens)
++    if qr_tokens:
++        block_t = 16 if dynamic else 8
++        kv_num_warps = 8 if dynamic else 4
++    else:
++        block_t = _prologue_block_t(num_tokens)
++        kv_num_warps = 4
+     qr_blocks = 1 + (extent + 256) // block_e
+     grid = (
+         triton.cdiv(num_tokens, block_t),
+@@ -978,39 +1208,128 @@
+         BLOCK_E=block_e,
+         QR_TOKENS=triton.cdiv(block_t, num_heads),
+         FUSE_QR=not qr_tokens,
+-        num_warps=4,
++        SKIP_IDLE_CACHE=prefill,
++        num_warps=kv_num_warps,
+         enable_fp_fusion=False,
+         launch_pdl=True,
+     )
+     if qr_tokens:
+-        _qr_rel_kernel[(triton.cdiv(num_tokens, qr_tokens), qr_blocks)](
+-            q,
+-            r,
+-            q_scale,
+-            r_scale,
+-            tau,
+-            rel_proj,
+-            q_out,
+-            rel_out,
+-            seq_idx,
+-            cu_seqlens_q,
+-            seq_lens,
+-            num_tokens,
+-            q.stride(0),
+-            r.stride(0),
+-            clip_threshold,
+-            rel_threshold,
+-            clip_eps,
+-            HQ=num_q_heads,
+-            D=head_dim,
+-            D_REL=d_rel,
+-            E=extent,
+-            SHIFT_W=rel_proj.shape[2],
+-            HAS_TAU=tau is not None,
+-            BLOCK_HQ=max(triton.next_power_of_2(num_q_heads), 16),
+-            BLOCK_E=block_e,
+-            QR_TOKENS=qr_tokens,
+-            num_warps=4,
+-            enable_fp_fusion=False,
+-            launch_pdl=True,
+-        )
++        if (
++            cu_seqlens_q.shape[0] == 2
++            and (extent + 256) % 128 == 0
++            and num_q_heads <= 64
++        ):
++            _qr_clip_only_kernel[(triton.cdiv(num_tokens, 8),)](
++                q,
++                q_scale,
++                tau,
++                q_out,
++                num_tokens,
++                q.stride(0),
++                clip_threshold,
++                clip_eps,
++                HQ=num_q_heads,
++                D=head_dim,
++                HAS_TAU=tau is not None,
++                BLOCK_HQ=max(triton.next_power_of_2(num_q_heads), 16),
++                BT=8,
++                num_warps=4,
++                enable_fp_fusion=False,
++            )
++            # sm_80: BM=64, TPC=2 beats BM=128, TPC=5 across 4k (1.10x), 8k (1.05x), and 12k (1.06x)
++            bm = 64 if num_q_heads <= 32 else 128
++            max_tpc = bm // num_q_heads
++            n_chunks = (extent + 256) // 128
++            tpc = max_tpc
++            cpp = n_chunks
++            n_tiles_upper = num_tokens // 128
++            if n_tiles_upper > 0:
++                _rel_sheared_batched_kernel[
++                    (128, triton.cdiv(n_tiles_upper, tpc), n_chunks // cpp)
++                ](
++                    r,
++                    r_scale,
++                    tau,
++                    rel_proj,
++                    rel_out,
++                    cu_seqlens_q,
++                    seq_lens,
++                    r.stride(0),
++                    rel_threshold,
++                    clip_eps,
++                    HQ=num_q_heads,
++                    D_REL=d_rel,
++                    E=extent,
++                    SHIFT_W=rel_proj.shape[2],
++                    HAS_TAU=tau is not None,
++                    BM=bm,
++                    TPC=tpc,
++                    BLOCK_E=128,
++                    CHUNKS_PER_PROG=cpp,
++                    num_warps=4,
++                    num_stages=2,
++                    enable_fp_fusion=False,
++                    launch_pdl=True,
++                )
++            _qr_rel_tail_kernel[(triton.cdiv(128, qr_tokens), (extent + 256) // block_e)](
++                q,
++                r,
++                q_scale,
++                r_scale,
++                tau,
++                rel_proj,
++                q_out,
++                rel_out,
++                seq_idx,
++                cu_seqlens_q,
++                seq_lens,
++                q.stride(0),
++                r.stride(0),
++                clip_threshold,
++                rel_threshold,
++                clip_eps,
++                HQ=num_q_heads,
++                D=head_dim,
++                D_REL=d_rel,
++                E=extent,
++                SHIFT_W=rel_proj.shape[2],
++                HAS_TAU=tau is not None,
++                BLOCK_HQ=max(triton.next_power_of_2(num_q_heads), 16),
++                BLOCK_E=block_e,
++                QR_TOKENS=qr_tokens,
++                num_warps=4,
++                enable_fp_fusion=False,
++                launch_pdl=True,
++            )
++        else:
++            _qr_rel_kernel[(triton.cdiv(num_tokens, qr_tokens), qr_blocks)](
++                q,
++                r,
++                q_scale,
++                r_scale,
++                tau,
++                rel_proj,
++                q_out,
++                rel_out,
++                seq_idx,
++                cu_seqlens_q,
++                seq_lens,
++                num_tokens,
++                q.stride(0),
++                r.stride(0),
++                clip_threshold,
++                rel_threshold,
++                clip_eps,
++                HQ=num_q_heads,
++                D=head_dim,
++                D_REL=d_rel,
++                E=extent,
++                SHIFT_W=rel_proj.shape[2],
++                HAS_TAU=tau is not None,
++                BLOCK_HQ=max(triton.next_power_of_2(num_q_heads), 16),
++                BLOCK_E=block_e,
++                QR_TOKENS=qr_tokens,
++                num_warps=4,
++                enable_fp_fusion=False,
++                launch_pdl=True,
++            )
 --- a/vllm/models/inkling2/quant_config.py
 +++ b/vllm/models/inkling2/quant_config.py
 @@ -43,7 +43,9 @@
@@ -449,9 +4223,283 @@
      @classmethod
      def get_min_capability(cls) -> int:
 -        return 90
-+        # sm_80 (Ampere): the experts run on Humming (bf16 maths, NVFP4 / MXFP8 weights), which
++        # 170HX (GA100, sm_80), 21 Nov 2026: the experts run on Humming (bf16 maths, NVFP4 / MXFP8 weights), which
 +        # has sm_80 heuristics; the Hopper-only kernels are routed to the SM12x branches (linear.py, conv_mix.py).
 +        return 80
  
      @staticmethod
      def get_config_filenames() -> list[str]:
+--- a/vllm/models/inkling2/speculator.py
++++ b/vllm/models/inkling2/speculator.py
+@@ -3,13 +3,105 @@
+ """DSpark speculator for the Inkling2 draft: stores the raw target features
+ (each draft layer mixes them itself) and runs its recurrent Markov head."""
+ 
++import os
++
+ import torch
+ import torch.nn as nn
+ 
+ from vllm.config import VllmConfig
++from vllm.distributed import get_tensor_model_parallel_world_size
++from vllm.platforms import current_platform
++from vllm.triton_utils import tl, tldevice, triton
++from vllm.v1.worker.gpu.sample.gumbel import (
++    _DRAFT_NOISE_SALT,
++    _gumbel_combine_kernel,
++    _log1p_neg_stable,
++    murmur3_uniform32,
++    spec_step_seed,
++)
++from vllm.v1.worker.gpu.spec_decode.draft_logits import draft_logits_row
+ from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+ from vllm.v1.worker.gpu.spec_decode.dspark.utils import load_dspark_model
+ 
++try:
++    from inkling_sm80_cuda import HAS_CUDA_EXT as _SM80_HAS_CUDA
++    from inkling_sm80_cuda import (
++        fused_markov_fold_gumbel_b1_cuda as _sm80_fused_markov_fold_gumbel_b1,
++    )
++except Exception:
++    _SM80_HAS_CUDA = False
++    _sm80_fused_markov_fold_gumbel_b1 = None
++
++
++@triton.jit
++def _sm80_add_softcap_gumbel_kernel(
++    local_argmax_ptr,
++    local_argmax_stride,
++    local_max_ptr,
++    local_max_stride,
++    logits_cache_ptr,
++    lc_s0,
++    lc_s1,
++    lc_col_ptr,
++    lc_row_map_ptr,
++    base_ptr,
++    base_stride,
++    bias_ptr,
++    bias_stride,
++    idx_map_ptr,
++    idx_map_stride,
++    seeds_ptr,
++    pos_ptr,
++    pos_stride,
++    temp_ptr,
++    vocab_size,
++    SOFTCAP: tl.constexpr,
++    BLOCK_SIZE: tl.constexpr,
++    HAS_CACHE: tl.constexpr,
++):
++    token_idx = tl.program_id(0).to(tl.int64)
++    block_idx = tl.program_id(1)
++    block = block_idx * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
++    mask = block < vocab_size
++
++    base = tl.load(
++        base_ptr + token_idx * base_stride + block, mask=mask, other=0.0
++    ).to(tl.float32)
++    bias = tl.load(
++        bias_ptr + token_idx * bias_stride + block, mask=mask, other=0.0
++    ).to(tl.float32)
++    s = (base + bias).to(tl.bfloat16)
++    s_cap = (tldevice.tanh(s / SOFTCAP) * SOFTCAP).to(tl.bfloat16)
++
++    req_idx = tl.load(idx_map_ptr + token_idx * idx_map_stride).to(tl.int64)
++    is_valid = req_idx >= 0
++    temp = tl.load(temp_ptr + req_idx, mask=is_valid, other=0.0).to(tl.float32)
++    seed = tl.load(seeds_ptr + req_idx, mask=is_valid, other=0)
++    pos = tl.load(pos_ptr + token_idx * pos_stride) - 1
++
++    if HAS_CACHE:
++        col = tl.load(lc_col_ptr)
++        row = draft_logits_row(req_idx, lc_row_map_ptr)
++        tl.store(
++            logits_cache_ptr + row * lc_s0 + col * lc_s1 + block,
++            s_cap,
++            mask=mask & (row >= 0),
++        )
++        seed = spec_step_seed(seed, col)
++
++    logits = s_cap.to(tl.float32)
++    if temp != 0.0:
++        logits = logits / temp
++        u = murmur3_uniform32(seed, pos + _DRAFT_NOISE_SALT, block.to(tl.uint32))
++        logits = logits + (-tl.log(-_log1p_neg_stable(u)))
++    logits = tl.where(mask, logits, float("-inf"))
++    lmax, lidx = tl.max(logits, axis=0, return_indices=True)
++    tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, lmax)
++    tl.store(
++        local_argmax_ptr + token_idx * local_argmax_stride + block_idx,
++        (block_idx * BLOCK_SIZE + lidx).to(tl.int64),
++    )
++
+ 
+ class Inkling2DSparkSpeculator(DSparkSpeculator):
+     _speculator_name = "Inkling2 DSpark"
+@@ -57,6 +149,125 @@
+         rows = self.hidden_states[(ends - 1).clamp_min(0).long()]
+         self.f_rnn[:num_reqs] = self.model.compute_f_rnn(rows)
+ 
++    def _sm80_can_fuse_softcap_gumbel(self) -> bool:
++        return (
++            current_platform.is_device_capability_family(80)
++            and os.environ.get("INKLING_SM80_NO_FUSED_GUMBEL") != "1"
++            and get_tensor_model_parallel_world_size() == 1
++            and self.draft_logits is not None
++            and self.draft_watermarker is None
++            and self._d2t_scatter_index is None
++            and self.acceptance_estimator is None
++            and not self.use_fp64_gumbel
++            and not self.use_confidence_head
++        )
++
++    def _sm80_fused_softcap_gumbel(
++        self,
++        base: torch.Tensor,
++        bias: torch.Tensor,
++        idx_map: torch.Tensor,
++        sample_pos: torch.Tensor,
++        step: int,
++    ) -> torch.Tensor:
++        assert self.draft_logits is not None
++        num_reqs = base.shape[0]
++        vocab_size = self.model.config.vocab_size
++        softcap = float(self.model.config.final_logit_softcapping)
++        block_size = 2048 if num_reqs <= 2 else 1024
++        num_warps = 4 if num_reqs <= 2 else 8
++        num_blocks = triton.cdiv(vocab_size, block_size)
++        local_argmax = torch.empty(
++            (num_reqs, num_blocks), dtype=torch.int64, device=base.device
++        )
++        local_max = torch.empty(
++            (num_reqs, num_blocks), dtype=torch.float32, device=base.device
++        )
++        out_tok = torch.empty((num_reqs,), dtype=torch.int64, device=base.device)
++        cache_vals = self.draft_logits.values
++        _sm80_add_softcap_gumbel_kernel[(num_reqs, num_blocks)](
++            local_argmax,
++            local_argmax.stride(0),
++            local_max,
++            local_max.stride(0),
++            cache_vals,
++            cache_vals.stride(0),
++            cache_vals.stride(1),
++            self._step_cols[step],
++            self.draft_logits.row_mapping,
++            base,
++            base.stride(0),
++            bias,
++            bias.stride(0),
++            idx_map,
++            idx_map.stride(0),
++            self.seeds,
++            sample_pos,
++            sample_pos.stride(0),
++            self.temperature,
++            vocab_size,
++            SOFTCAP=softcap,
++            BLOCK_SIZE=block_size,
++            HAS_CACHE=True,
++            num_warps=num_warps,
++        )
++        _gumbel_combine_kernel[(num_reqs,)](
++            local_argmax,
++            local_argmax.stride(0),
++            local_max,
++            local_max.stride(0),
++            out_tok,
++            num_blocks,
++            PADDED_NUM_BLOCKS=triton.next_power_of_2(num_blocks),
++        )
++        return out_tok
++
++    def _sm80_fused_markov_fold_gumbel_b1(
++        self,
++        latent: torch.Tensor,
++        base: torch.Tensor,
++        idx_map: torch.Tensor,
++        sample_pos: torch.Tensor,
++        step: int,
++    ) -> torch.Tensor:
++        assert self.draft_logits is not None
++        mh = self.model.model.markov_head
++        assert mh.fold_weight is not None and mh.fold_bias is not None
++        vocab_size = self.model.config.vocab_size
++        softcap = float(self.model.config.final_logit_softcapping)
++        block_v = 256  # 8 warps x 32 rows
++        num_blocks = triton.cdiv(vocab_size, block_v)
++        local_argmax = torch.empty((1, num_blocks), dtype=torch.int64, device=base.device)
++        local_max = torch.empty((1, num_blocks), dtype=torch.float32, device=base.device)
++        out_tok = torch.empty((1,), dtype=torch.int64, device=base.device)
++        _sm80_fused_markov_fold_gumbel_b1(
++            latent,
++            mh.fold_weight,
++            mh.fold_bias,
++            base,
++            self.draft_logits.values,
++            local_argmax,
++            local_max,
++            idx_map,
++            self.seeds,
++            sample_pos,
++            self.temperature,
++            self._step_cols[step],
++            self.draft_logits.row_mapping,
++            vocab_size,
++            softcap,
++        )
++        _gumbel_combine_kernel[(1,)](
++            local_argmax,
++            local_argmax.stride(0),
++            local_max,
++            local_max.stride(0),
++            out_tok,
++            num_blocks,
++            PADDED_NUM_BLOCKS=triton.next_power_of_2(num_blocks),
++        )
++        return out_tok
++
+     def _sample_sequential(self, num_reqs: int, head_hidden: torch.Tensor) -> None:
+         n_spec = self.num_speculative_steps
+         num_sample = num_reqs * n_spec
+@@ -67,11 +278,34 @@
+         sample_pos = self.sample_pos[:num_sample].view(num_reqs, n_spec)
+         state = hidden.new_zeros(num_reqs, self.model.config.markov_rank)
+         prev = self.input_buffers.input_ids[self._anchor_idx[:num_reqs]]
++        use_fused = self._sm80_can_fuse_softcap_gumbel()
++        mh = self.model.model.markov_head
++        use_fused_b1 = (
++            use_fused
++            and _SM80_HAS_CUDA
++            and os.environ.get("INKLING_SM80_NO_CUDA_MFG") != "1"
++            and num_reqs == 1
++            and mh.markov_rank == 256
++            and mh.fold_weight is not None
++            and mh.fold_bias is not None
++            and mh.fold_weight.is_contiguous()
++            and mh.fold_bias.is_contiguous()
++        )
+         for i in range(n_spec):
+-            state, bias = self.model.markov_step(state, prev, context[i])
+-            if self.draft_logits is None:
+-                prev = self.model.markov_argmax(base_logits[:, i], bias)
++            if use_fused_b1:
++                state, latent = mh.step_latent(state, prev, context[i])
++                prev = self._sm80_fused_markov_fold_gumbel_b1(
++                    latent, base_logits[:, i], idx_map[:, i], sample_pos[:, i], i
++                )
+             else:
+-                logits = self.model.markov_logits(base_logits[:, i], bias)
+-                prev = self._sample_logits(logits, idx_map[:, i], sample_pos[:, i], i)
++                state, bias = self.model.markov_step(state, prev, context[i])
++                if self.draft_logits is None:
++                    prev = self.model.markov_argmax(base_logits[:, i], bias)
++                elif use_fused:
++                    prev = self._sm80_fused_softcap_gumbel(
++                        base_logits[:, i], bias, idx_map[:, i], sample_pos[:, i], i
++                    )
++                else:
++                    logits = self.model.markov_logits(base_logits[:, i], bias)
++                    prev = self._sample_logits(logits, idx_map[:, i], sample_pos[:, i], i)
+             self.draft_tokens[:num_reqs, i] = prev
